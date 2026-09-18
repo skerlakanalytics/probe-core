@@ -1,0 +1,29 @@
+[project]
+name = "probe-core"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Nico Kobler", email = "iamnckblr@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "boto3==1.43.42",
+    "duckdb==1.4.3",
+    "geopandas==1.1.1",
+    "numpy==1.26.4",
+    "pandas==2.3.3",
+    "psutil==7.2.2",
+    "python-dotenv==1.0.1",
+    "rasterio==1.4.3",
+    "shapely==2.1.2",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
