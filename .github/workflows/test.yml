@@ -1,0 +1,22 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v3
+      - name: Install (exactly the locked versions)
+        run: uv sync --locked
+      - name: Lint (undefined names, unused imports)
+        run: uvx ruff check --select F src tests
+      - name: Tests
+        run: uv run pytest -q
