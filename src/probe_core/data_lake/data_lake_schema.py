@@ -409,10 +409,14 @@ GOLD_ZSTD_LEVEL      = 9      # final kachel files are write-once/read-many
 # values the simulations ran with); data_lake_gold_worker.py imports them from
 # here so gold's stored Druck is computed with the same constants everywhere.
 import configparser
-from pathlib import Path
+from importlib.resources import files
 
 _com1dfa_cfg = configparser.ConfigParser(interpolation=None)
-_com1dfa_cfg.read(Path(__file__).resolve().parent.parent / "input" / "cfgCom1DFA_template.ini")
+# Shipped inside the package (probe_core/data/); read_string instead of read()
+# because read() silently ignores a missing file and would leave rho/gravAcc
+# undefined until the getfloat below fails with a less obvious error.
+_com1dfa_cfg.read_string(
+    files("probe_core").joinpath("data", "cfgCom1DFA_template.ini").read_text(encoding="utf-8"))
 PRESSURE_RHO = _com1dfa_cfg.getfloat("GENERAL", "rho")      # kg/m³ (1800: debris flow)
 GRAVITY      = _com1dfa_cfg.getfloat("GENERAL", "gravAcc")  # m/s²
 

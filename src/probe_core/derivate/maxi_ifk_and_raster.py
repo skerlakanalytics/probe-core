@@ -35,7 +35,6 @@ why the original full-lookup join OOM'd and got fixed this way).
 """
 
 import os
-import sys
 import uuid
 from datetime import datetime
 
@@ -47,19 +46,21 @@ import rasterio
 from rasterio.crs import CRS
 from rasterio.transform import from_origin
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Single source of truth for the pixel↔anriss reach bound (nominal DEM cap is
 # 800 m, measured up to ~932 m — see data_lake_schema.py). Re-exported for the
 # explorer's kachel-candidate logic.
-from data_lake.data_lake_schema import (  # noqa: E402
+from probe_core.data_lake.data_lake_schema import (  # noqa: F401 (GOLD_MAX_REACH_M is re-exported)
     GOLD_MAX_REACH_M, GOLD_P_H_MEAN, GOLD_P_H_MAX,
     DATA_LAKE_PROBABILITIES_RATES_LOOKUP, DATA_LAKE_PROBABILITIES_RATES_ABLAUF,
 )
-from data_lake.data_interface import (  # noqa: E402
-    GOLD_S3_ROOT, S3_BUCKET_GOLD, _s3_gold_connection, safe_duckdb_memory_limit,
-    container_memory_limit_bytes, container_cpu_limit, duckdb_max_temp_directory_size,
+from probe_core.data_lake.data_interface import (
+    GOLD_S3_ROOT, S3_BUCKET_GOLD, _s3_gold_connection,
 )
-from utils import configure_s3_for_duckdb  # noqa: E402
+from probe_core.resources import (
+    container_cpu_limit, container_memory_limit_bytes,
+    duckdb_max_temp_directory_size, safe_duckdb_memory_limit,
+)
+from probe_core.s3 import configure_s3_for_duckdb
 
 # p_Ablauf (geo7 table) -- S3 mirror of the git-tracked input/ file, read the
 # same way as the probability lookup (no local-file dependency; every caller

@@ -50,7 +50,6 @@ import json
 import math
 import os
 import shutil
-import sys
 import threading
 import time
 from functools import lru_cache
@@ -59,34 +58,37 @@ from pathlib import Path
 import duckdb
 import geopandas as gpd
 import pandas as pd
-import psutil
 from shapely.geometry import box
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from probe_config import load_config  # noqa: E402
-from utils import configure_s3_for_duckdb, S3_CONFIG  # noqa: E402
-from data_lake.data_lake_schema import (  # noqa: E402
+from probe_core.campaign import (
+    DEFAULT_INPUT_BUCKET, EVENT_MANIFEST_KEY, EVENTS_PER_BATCH, PHYSICS_GRID,
+)
+from probe_core.data_lake.data_lake_schema import (
     BATCH_SILVER_S3_SUFFIX, DATA_LAKE_DIR_SILVER, DATA_LAKE_DIR_GOLD_SIM_SPATIAL,
     DATA_LAKE_DIR_GOLD_SIM_ANRISS, DATA_LAKE_DIR_DERIVATE_HULLS, GOLD_MAX_REACH_M,
     BATCH_RANGE_SIZE, batch_range_prefix,
 )
+# Sizing helpers moved to probe_core.resources; re-exported here because both
+# the app and the pipeline import them from this module.
+from probe_core.resources import (  # noqa: F401
+    container_cpu_limit, container_memory_limit_bytes,
+    duckdb_max_temp_directory_size, safe_duckdb_memory_limit,
+)
+from probe_core.s3 import configure_s3_for_duckdb
 
 # ── CONFIGURATION ────────────────────────────────────────────────────────────
 CRS_LV95 = "EPSG:2056"
 
-_config = load_config()
-
-# Physics grid: config/app.yaml physics_grid, applied uniformly to every
+# Physics grid: probe_core.campaign.PHYSICS_GRID, applied uniformly to every
 # anriss -- not gold-derived, but needed to enumerate every (mu, xsi, tau0)
 # combination a given anriss will eventually get.
-_maxi_params = _config["physics_grid"]
+_maxi_params = PHYSICS_GRID
 _PHYSICS_GRID = list(itertools.product(_maxi_params["mu"], _maxi_params["xsi"], _maxi_params["tau0"]))
 
-# config/app.yaml events_per_batch -- same value the pipeline's
+# EVENTS_PER_BATCH (probe_core.campaign) -- same value the pipeline's
 # workers/batch_worker.py batch_id_expr uses ((sort_key - 1) // EVENTS_PER_BATCH + 1) --
 # needed by _hull_fragment_s3_key below to compute an id_anriss's batch/range
 # straight from arithmetic, matching the campaign's actual batching.
-EVENTS_PER_BATCH = _config["events_per_batch"]
 
 # Local state for probe_explorer's app-level caches (catalog index, gold
 # finalize manifest). This module's CODE lives in probe_control_center now,
@@ -98,21 +100,23 @@ EVENTS_PER_BATCH = _config["events_per_batch"]
 # that only need this file's non-catalog functions — parents=True because
 # `probe_explorer/` legitimately doesn't exist there, and this cache is
 # never populated on that host anyway.
-LOCAL_STATE_DIR = Path.home() / "probe_explorer" / "local_state"
-LOCAL_STATE_DIR.mkdir(parents=True, exist_ok=True)
+# PROBE_LOCAL_STATE_DIR overrides the location; the directory is created on
+# first use (_connect_local_db_with_retry), not on import.
+LOCAL_STATE_DIR = Path(os.getenv("PROBE_LOCAL_STATE_DIR")
+                       or Path.home() / "probe_explorer" / "local_state")
 CATALOG_DB_PATH       = str(LOCAL_STATE_DIR / "catalog.db")
 GOLD_MANIFEST_DB_PATH = str(LOCAL_STATE_DIR / "gold_manifest.db")
 
 S3_BUCKET_GOLD = os.getenv("PROBE_S3_BUCKET_GOLD", "maxi")
 # The "input" bucket is a separate object-storage bucket (same endpoint/
-# credentials, see utils.S3_CONFIG) holding fleet-wide static reference
+# credentials, see probe_core.s3.S3_CONFIG) holding fleet-wide static reference
 # inputs (DEM, cfgCom1DFA_template.ini, event manifests) -- auto-downloaded
 # by every worker VM during provisioning (infra_ops/roles/application_setup),
 # so anything placed there should genuinely be needed fleet-wide, not just
 # by this app. prozessquelle.parquet (input/prozessquelle.parquet, uploaded
 # 2026-08-20) is the one exception used purely for map display here — kept
 # there rather than a maxi-bucket derivate folder per explicit instruction.
-S3_BUCKET_INPUT = _config["s3"]["input_bucket"]
+S3_BUCKET_INPUT = os.getenv("PROBE_S3_BUCKET_INPUT", DEFAULT_INPUT_BUCKET)
 
 # Upfront simulation plan (not gold — this exists before any simulation
 # runs) — the 540MB, 61.3M-row manifest, read straight off S3 (same
@@ -130,7 +134,7 @@ S3_BUCKET_INPUT = _config["s3"]["input_bucket"]
 # after confirming every read site had already been, or could be, migrated
 # to the catalog.db index -- see git history if the old download path is
 # ever needed as a reference).
-EVENT_MANIFEST_S3_URI = f"s3://{S3_BUCKET_INPUT}/{_config['event_manifest']}"
+EVENT_MANIFEST_S3_URI = f"s3://{S3_BUCKET_INPUT}/{EVENT_MANIFEST_KEY}"
 
 # All reads in this module are against SIM_SPATIAL (bbox/pixel access) — the
 # SIM_ANRISS cousin (data_lake/build_silver_to_gold_anriss.py) has no reader here
@@ -330,92 +334,6 @@ def _empty_gold_df() -> pd.DataFrame:
     return pd.DataFrame(columns=_GOLD_COLUMNS)
 
 
-# DuckDB's own memory_limit only bounds ITS internal buffer pool -- it does
-# NOT cover rows already pulled out via .df()/.fetchdf() into pandas, which
-# is where an unbounded CALLER (e.g. accumulating many kacheln's worth of
-# rows in a Python list across a big bbox loop) can still grow past whatever
-# this limit says and take the whole host down regardless of it -- see
-# derivate/maxi_ifk_and_raster.py's raster-kachel-count cap for the guard
-# against THAT specific failure mode. Setting memory_limit here is still
-# worth doing as a floor: it stops a single pathological query (a huge
-# unbounded read/join) from ever growing DuckDB's OWN buffers past a safe
-# share of the host's RAM -- whatever that host's RAM turns out to be
-# (2026-08-16: an unconstrained raster job OOM-killed the entire WSL VM, not
-# just the Streamlit process, on a 15 GB dev box -- this app has to stay
-# safe on "whichever system it runs on", not just the box it was built on).
-_DUCKDB_MEMORY_FRACTION = 0.25
-_DUCKDB_MEMORY_LIMIT_MIN_BYTES = 512 * 1024 * 1024       # floor -- below this DuckDB can't do useful work at all
-_DUCKDB_MEMORY_LIMIT_MAX_BYTES = 4 * 1024 * 1024 * 1024  # ceiling -- several connections can coexist (one per session/thread), so no single one gets to claim an unbounded share
-
-
-def container_memory_limit_bytes() -> int:
-    """RAM this process may actually use: the cgroup limit when running in a
-    container, otherwise the host's physical RAM.
-
-    psutil.virtual_memory().total reports the NODE's RAM inside a container,
-    not the pod's limit. Measured in the Hosttech rehearsal 2026-09-16: psutil
-    saw 16.8 GB while /sys/fs/cgroup/memory.max said 8.6 GB, which sized
-    max_raster_kacheln() at 159 kacheln where the pod's own limit implies ~82.
-    Sizing guards off the node is how a pod gets to accept work it cannot
-    survive -- see NOTES.md, rehearsal finding 3."""
-    host_total = psutil.virtual_memory().total
-    for path in ('/sys/fs/cgroup/memory.max',                     # cgroup v2
-                 '/sys/fs/cgroup/memory/memory.limit_in_bytes'):  # cgroup v1
-        try:
-            raw = open(path).read().strip()
-        except OSError:
-            continue
-        if raw == 'max':          # v2 spelling for "no limit"
-            break
-        try:
-            limit = int(raw)
-        except ValueError:
-            continue
-        # v1 reports a huge sentinel when unlimited; anything >= host RAM is
-        # not a real constraint either way
-        if 0 < limit < host_total:
-            return limit
-        break
-    return host_total
-
-
-def container_cpu_limit() -> int:
-    """CPUs this process may actually use: the cgroup quota when running in a
-    container, otherwise os.cpu_count(). Same reasoning as
-    container_memory_limit_bytes -- os.cpu_count() sees the node's 8 CPUs
-    while the pod's cpu.max allowed 4, and oversubscribing threads multiplies
-    DuckDB's concurrent on-disk spill."""
-    try:
-        quota, period = open('/sys/fs/cgroup/cpu.max').read().split()
-        if quota != 'max':
-            return max(1, int(int(quota) / int(period)))
-    except (OSError, ValueError):
-        pass
-    return os.cpu_count() or 1
-
-
-def duckdb_max_temp_directory_size() -> str | None:
-    """Cap for DuckDB's on-disk spill, from PROBE_DUCKDB_MAX_TEMP_SIZE
-    (e.g. '50GB'), or None to leave DuckDB's own default alone.
-
-    DuckDB defaults to "90% of available disk space", which inside a pod means
-    90% of the NODE's filesystem: it cannot see an emptyDir's sizeLimit, so it
-    spills until the kubelet evicts the pod. Any k8s deployment should set this
-    env var to match the volume it writes into."""
-    return os.getenv('PROBE_DUCKDB_MAX_TEMP_SIZE') or None
-
-
-def safe_duckdb_memory_limit() -> str:
-    """DuckDB memory_limit string (e.g. '2048MB'), sized to a safe fraction
-    of the RAM this process may actually use and clamped to [512MB, 4GB] --
-    so the same code behaves safely on an 8 GB laptop, a 64 GB server, or a
-    memory-capped container alike, instead of a value tuned for one box."""
-    total = container_memory_limit_bytes()
-    budget = min(max(int(total * _DUCKDB_MEMORY_FRACTION), _DUCKDB_MEMORY_LIMIT_MIN_BYTES),
-                 _DUCKDB_MEMORY_LIMIT_MAX_BYTES)
-    return f"{budget // (1024 * 1024)}MB"
-
-
 def _s3_gold_connection() -> duckdb.DuckDBPyConnection:
     """Fresh DuckDB connection configured for the gold lake's S3 bucket.
     Deliberately NOT reused/cached across calls: every extraction call pays
@@ -453,6 +371,7 @@ def _connect_local_db_with_retry(path: str) -> duckdb.DuckDBPyConnection:
     are once-per-process @lru_cache singletons, so a short retry here is
     enough to ride out a transient competing process instead of crashing
     the whole session on the very first query."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     delay = 0.5
     for attempt in range(6):
         try:

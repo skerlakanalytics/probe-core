@@ -1,23 +1,29 @@
 [project]
 name = "probe-core"
 version = "0.1.0"
-description = "Add your description here"
+description = "Shared S3 access, data-lake schema and read layer, and derivate computations of the Pro-BE Äxplorer / MAXI projects"
 readme = "README.md"
 authors = [
     { name = "Nico Kobler", email = "iamnckblr@gmail.com" }
 ]
 requires-python = ">=3.12"
+# Ranges, not exact pins: this is a library, and both consumers (pgr-atlas,
+# ProBE_control_center) pin their own exact versions. Lower bounds are the
+# versions the code was tested with in pgr-atlas (2026-09).
 dependencies = [
-    "boto3==1.43.42",
-    "duckdb==1.4.3",
-    "geopandas==1.1.1",
-    "numpy==1.26.4",
-    "pandas==2.3.3",
-    "psutil==7.2.2",
-    "python-dotenv==1.0.1",
-    "rasterio==1.4.3",
-    "shapely==2.1.2",
+    "boto3>=1.34",
+    "duckdb>=1.4,<2",
+    "geopandas>=1.0,<2",
+    "numpy>=1.26,<3",
+    "pandas>=2.2,<3",
+    "psutil>=5.9",
+    "rasterio>=1.4,<2",
+    "shapely>=2.0,<3",
 ]
+
+[project.optional-dependencies]
+# Only the raster-derivate batch driver (run_pass/_run_pool) uses Ray.
+ray = ["ray>=2.40"]
 
 [build-system]
 requires = ["uv_build>=0.12.13,<0.13.0"]

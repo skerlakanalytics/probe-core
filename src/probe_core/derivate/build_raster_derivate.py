@@ -100,57 +100,30 @@ derivate up to the latest finalized kacheln; promote to a standing loop +
 dedicated node later if this becomes a permanent job, same path silver_to_
 gold_anriss/hull-fragments already took.
 
-Usage:
-    python derivate/build_raster_derivate.py                  # local-only smoke test
-    python derivate/build_raster_derivate.py --upload          # + S3
-    python derivate/build_raster_derivate.py --upload --limit 5      # smoke test: first 5 pending kacheln
-    python derivate/build_raster_derivate.py --upload --force --kachel 2611017,2611018  # targeted manual rebuild
+This module holds the computation and the batch driver (run_pass, _run_pool).
+The command-line entry point (argument parsing, defaults from config/jobs.yaml
+[raster_derivate]) lives in ProBE_control_center, which owns the job settings:
+    python derivate/build_raster_derivate.py --upload [--limit 5] [--force --kachel ...]
+The app only uses the read side (list_config_manifests, latest_config_manifest,
+the prefix/column helpers).
 
-Worker resources (workers/cpus-per-worker/mem-per-worker-gb/duckdb-memory)
-and the thresholds/return_periods matrix default from config/jobs.yaml
-[raster_derivate] (CLI flags override the resource settings; the matrix
-itself is config-only for now, see that section's header comment).
-
-Running this batch job is a pipeline task: run it from ProBE_control_center,
-which has config/jobs.yaml. pgr-atlas only imports this module's functions;
-its config/app.yaml has no raster_derivate section, so the CLI here stops with
-an error instead of computing with an empty matrix.
+Ray is needed only by _run_pool (and so run_pass): install probe-core[ray].
 """
 
-import argparse
 import hashlib
 import json
 import os
 import shutil
-import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
 import pandas as pd
-import ray
-from ray.util.actor_pool import ActorPool
 
-_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
-sys.path.insert(0, _REPO_ROOT)
-# Also exported via PYTHONPATH (not just sys.path), and done before ray.init()
-# below -- sys.path.insert only fixes imports in THIS (driver) process. Ray's
-# ActorPool workers are separate subprocesses that inherit os.environ (so
-# PYTHONPATH) but NOT the driver's runtime sys.path mutations. Unlike this
-# script's siblings (build_silver_to_gold_anriss.py, build_hull_fragments.py),
-# which are only ever launched via a loop script that `cd`s to the repo root
-# first (see run_silver_to_gold_anriss_loop.sh/run_hull_fragments_loop.sh),
-# this one is meant for direct manual invocation from wherever -- confirmed
-# 2026-08-25: running `cd derivate && python build_raster_derivate.py` failed
-# every worker with "ModuleNotFoundError: No module named 'utils'" without this.
-os.environ['PYTHONPATH'] = os.pathsep.join(
-    p for p in [_REPO_ROOT, os.environ.get('PYTHONPATH', '')] if p)
-from probe_config import load_config  # noqa: E402
-from utils import get_s3_resource, configure_s3_for_duckdb  # noqa: E402
-from data_lake.data_lake_schema import DATA_LAKE_DIR_DERIVATE_RASTER  # noqa: E402
-from data_lake.data_interface import GOLD_S3_ROOT, S3_BUCKET_GOLD  # noqa: E402
-from derivate.maxi_ifk_and_raster import (  # noqa: E402
+from probe_core.s3 import get_s3_resource, configure_s3_for_duckdb
+from probe_core.data_lake.data_lake_schema import DATA_LAKE_DIR_DERIVATE_RASTER
+from probe_core.data_lake.data_interface import GOLD_S3_ROOT, S3_BUCKET_GOLD
+from probe_core.derivate.maxi_ifk_and_raster import (
     INTENSITY_VARS, _GOLD_COL, _TO_DISPLAY, _lambda_ereignis_sql,
     _register_ablauf, _bind_probability_lookup, _assert_valid_lambda_ereignis,
     _is_missing_kachel, kachel_s3_file, _write_multiband,
@@ -541,6 +514,11 @@ def _run_pool(worker_cls, actor_kwargs, method_name, jobs, n_workers, cpus_per_w
     summary."""
     if not jobs:
         return []
+    # Imported here, not at module level: only the batch jobs need Ray, and the
+    # app imports this module for its read-side helpers without having Ray
+    # installed (probe-core[ray] provides it).
+    import ray
+    from ray.util.actor_pool import ActorPool
     if not ray.is_initialized():
         ray.init(configure_logging=False, object_store_memory=10**9)
     RemoteCls = ray.remote(
@@ -719,98 +697,3 @@ def _upload_config_manifest(bucket, cfg_hash, thresholds, return_periods):
     s3 = get_s3_resource()
     s3.Object(bucket, f"{config_prefix(cfg_hash)}/_config.json").put(
         Body=json.dumps(manifest, indent=2).encode())
-
-
-def parse_args():
-    # Pipeline job settings; absent from pgr-atlas's config/app.yaml (see the
-    # module docstring), so both fall back to empty and the check below stops.
-    cfg = load_config()
-    rd = cfg.get("raster_derivate", {})
-    sg = cfg.get("silver_to_gold", {})
-    p = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--bucket", default=sg.get("s3_bucket_gold", S3_BUCKET_GOLD),
-                    help="S3 bucket holding Data-Lake-Gold/ (default: config/jobs.yaml silver_to_gold.s3_bucket_gold)")
-    p.add_argument("--out-dir", default="~/probe_data/raster_derivate",
-                    help="Local root for output (and the resumability source of truth when --upload is not set)")
-    p.add_argument("--upload", action="store_true",
-                    help="Also write to s3://<bucket>/Data-Lake-Derivate/raster/ (opt-in, off by default)")
-    p.add_argument("--loop", type=int, metavar="SECONDS", default=None,
-                    help="Repeat forever, sleeping this many seconds between passes (default: run one pass and exit)")
-    p.add_argument("--limit", type=int, default=None,
-                    help="Only process the first N pending kacheln this pass (smoke test)")
-    p.add_argument("--kachel", default=None,
-                    help="Comma-separated id_kachel list -- scope this run to specific kacheln "
-                         "(e.g. a targeted manual rebuild after a probability_lookup/ablauf correction)")
-    p.add_argument("--force", action="store_true",
-                    help="Recompute even if already done for this config hash (manual rebuild after "
-                         "a probability_lookup/ablauf correction -- see module docstring's Immutability section)")
-    p.add_argument("--workers", type=int, default=rd.get("workers", 4),
-                    help="Number of ray workers (default: config/jobs.yaml raster_derivate.workers)")
-    p.add_argument("--cpus-per-worker", type=int, default=rd.get("cpus_per_worker", 1))
-    p.add_argument("--mem-per-worker-gb", type=float, default=rd.get("mem_per_worker_gb", 4))
-    p.add_argument("--duckdb-memory", default=rd.get("duckdb_memory", "3GB"),
-                    help="DuckDB max_memory cap inside each worker")
-    args = p.parse_args()
-    args.out_dir = Path(args.out_dir).expanduser()
-    args.only_kacheln = [int(k) for k in args.kachel.split(',')] if args.kachel else None
-    args.thresholds = rd.get("thresholds", [])
-    args.return_periods = rd.get("return_periods", [])
-    if not args.thresholds and not args.return_periods:
-        p.error("raster_derivate.thresholds and .return_periods are both empty — run this job from ProBE_control_center (config/jobs.yaml), nothing to compute")
-    return args
-
-
-def main():
-    args = parse_args()
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-
-    # 2026-08-28: caught a real disk-full production incident -- each ray
-    # actor's own worker_temp_dir() (keyed by pid, see that function) was
-    # never cleaned up on exit, so every restart of this loop left its
-    # workers' entire DuckDB spill history behind as dead weight under a
-    # NEW pid. Traced back to worker directories dating to 2026-08-25 (the
-    # very first multi-worker run) still present 3 days and several
-    # restarts later -- 65 orphaned worker_<pid> dirs, 620GB, filled a
-    # 985GB disk to 0 bytes free and crashed the whole ray cluster (Ray's
-    # own event-log flush failing with "No space left on device").
-    # Anything already in .duckdb_tmp/ at this point is guaranteed
-    # orphaned -- THIS run hasn't created any worker actors (and their
-    # pids) yet, so every existing worker_<pid> subdirectory belongs to a
-    # previous, no-longer-running invocation. Clear it before workers
-    # start, not after they finish -- a from-scratch catch-up pass can run
-    # for many hours, so cleaning only at the end would still let one run's
-    # own spill files accumulate unbounded across that whole pass.
-    duckdb_tmp_root = args.out_dir / '.duckdb_tmp'
-    if duckdb_tmp_root.exists():
-        shutil.rmtree(duckdb_tmp_root, ignore_errors=True)
-
-    cfg_hash = config_hash(args.thresholds, args.return_periods)
-
-    if args.upload:
-        # Eager, not just after run_pass finishes (see run_pass's own
-        # end-of-pass upload) -- a from-scratch catch-up pass over the whole
-        # finalized set can take days, and a consumer (e.g. probe_explorer's
-        # Derivate view, via latest_config_manifest) needs the manifest to
-        # exist from the START of a run, not just once it completes.
-        _upload_config_manifest(args.bucket, cfg_hash, args.thresholds, args.return_periods)
-
-    def one_pass():
-        run_pass(args.out_dir, cfg_hash, args.thresholds, args.return_periods, args.upload, args.bucket,
-                  args.workers, args.cpus_per_worker, args.mem_per_worker_gb, args.duckdb_memory,
-                  only_kacheln=args.only_kacheln, force=args.force, limit=args.limit)
-
-    if args.loop is None:
-        one_pass()
-        return
-    while True:
-        try:
-            one_pass()
-        except Exception as e:
-            print(f"pass FAILED: {e}", flush=True)
-        print(f"sleeping {args.loop}s", flush=True)
-        time.sleep(args.loop)
-
-
-if __name__ == "__main__":
-    main()

@@ -46,21 +46,19 @@ Run this LOCALLY wrapped in a memory/IO cgroup per CLAUDE.md's hard rule for
 heavy local IO jobs -- e.g.:
     systemd-run --user --scope -p MemoryHigh=4500M -p MemoryMax=6G \\
       -p "IOReadBandwidthMax=/dev/sdd 150M" -p "IOWriteBandwidthMax=/dev/sdd 150M" \\
-      setsid nohup python derivate/build_raster_derivate_mosaic.py --upload \\
+      setsid nohup python -m probe_core.derivate.build_raster_derivate_mosaic --upload \\
       > mosaic.log 2>&1 &
 
 Usage:
-    python derivate/build_raster_derivate_mosaic.py                # local-only smoke test
-    python derivate/build_raster_derivate_mosaic.py --upload        # + S3
-    python derivate/build_raster_derivate_mosaic.py --cfg-hash a93cb36a --upload
+    python -m probe_core.derivate.build_raster_derivate_mosaic                # local-only smoke test
+    python -m probe_core.derivate.build_raster_derivate_mosaic --upload        # + S3
+    python -m probe_core.derivate.build_raster_derivate_mosaic --cfg-hash a93cb36a --upload
 """
 
 import argparse
 import json
-import os
 import shutil
 import subprocess
-import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -69,13 +67,8 @@ import numpy as np
 import rasterio
 import rasterio.shutil as rio_shutil
 
-_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
-sys.path.insert(0, _REPO_ROOT)
-os.environ['PYTHONPATH'] = os.pathsep.join(
-    p for p in [_REPO_ROOT, os.environ.get('PYTHONPATH', '')] if p)
-
-from utils import get_s3_client, configure_s3_for_duckdb  # noqa: E402
-from derivate.build_raster_derivate import (  # noqa: E402
+from probe_core.s3 import get_s3_client, configure_s3_for_duckdb
+from probe_core.derivate.build_raster_derivate import (
     geotiff_prefix, geotiff_filename, config_prefix, list_precomputed_kacheln,
     latest_config_manifest, S3_BUCKET_GOLD,
 )
