@@ -61,7 +61,7 @@ import pandas as pd
 from shapely.geometry import box
 
 from probe_core.campaign import (
-    DEFAULT_INPUT_BUCKET, EVENT_MANIFEST_KEY, EVENTS_PER_BATCH, PHYSICS_GRID,
+    EVENT_MANIFEST_KEY, EVENTS_PER_BATCH, PHYSICS_GRID,
 )
 from probe_core.data_lake.data_lake_schema import (
     BATCH_SILVER_S3_SUFFIX, DATA_LAKE_DIR_SILVER, DATA_LAKE_DIR_GOLD_SIM_SPATIAL,
@@ -108,19 +108,9 @@ CATALOG_DB_PATH       = str(LOCAL_STATE_DIR / "catalog.db")
 GOLD_MANIFEST_DB_PATH = str(LOCAL_STATE_DIR / "gold_manifest.db")
 
 S3_BUCKET_GOLD = os.getenv("PROBE_S3_BUCKET_GOLD", "maxi")
-# The "input" bucket is a separate object-storage bucket (same endpoint/
-# credentials, see probe_core.s3.S3_CONFIG) holding fleet-wide static reference
-# inputs (DEM, cfgCom1DFA_template.ini, event manifests) -- auto-downloaded
-# by every worker VM during provisioning (infra_ops/roles/application_setup),
-# so anything placed there should genuinely be needed fleet-wide, not just
-# by this app. prozessquelle.parquet (input/prozessquelle.parquet, uploaded
-# 2026-08-20) is the one exception used purely for map display here — kept
-# there rather than a maxi-bucket derivate folder per explicit instruction.
-S3_BUCKET_INPUT = os.getenv("PROBE_S3_BUCKET_INPUT", DEFAULT_INPUT_BUCKET)
-
 # Upfront simulation plan (not gold — this exists before any simulation
 # runs) — the 540MB, 61.3M-row manifest, read straight off S3 (same
-# httpfs/read_parquet pattern as prozessquelle.parquet below), never
+# httpfs/read_parquet pattern as the gold reads), never
 # downloaded/cached locally. It's only ever read in full once per process,
 # by get_catalog_con() below to build the local catalog.db index — every
 # other function in this module (get_event_params, id_anriss_exists,
@@ -134,7 +124,13 @@ S3_BUCKET_INPUT = os.getenv("PROBE_S3_BUCKET_INPUT", DEFAULT_INPUT_BUCKET)
 # after confirming every read site had already been, or could be, migrated
 # to the catalog.db index -- see git history if the old download path is
 # ever needed as a reference).
-EVENT_MANIFEST_S3_URI = f"s3://{S3_BUCKET_INPUT}/{EVENT_MANIFEST_KEY}"
+# Read from the GOLD bucket's root, not the `input` bucket (2026-09-23): a
+# byte-identical copy of input/maxi_event_manifest.parquet lives at the root
+# of both `maxi` and `adelboden-test`, so the app's data comes from one bucket
+# and its S3 key doesn't need `input` access. The fleet keeps reading the
+# `input` original during provisioning -- if the manifest is ever re-issued,
+# re-copy it to both gold buckets.
+EVENT_MANIFEST_S3_URI = f"s3://{S3_BUCKET_GOLD}/{EVENT_MANIFEST_KEY}"
 
 # All reads in this module are against SIM_SPATIAL (bbox/pixel access) — the
 # SIM_ANRISS cousin (data_lake/build_silver_to_gold_anriss.py) has no reader here
@@ -1077,48 +1073,6 @@ def load_kachel_coverage() -> gpd.GeoDataFrame:
              for k in kacheln]
     return gpd.GeoDataFrame({"region": [f"Kachel {k}" for k in kacheln]},
                             geometry=geoms, crs=CRS_LV95)
-
-
-def load_prozessquelle_geojson() -> dict:
-    """Prozessquelle boundary polygons (s3://{S3_BUCKET_INPUT}/prozessquelle.parquet,
-    5032 rows, id_pq/area_m2/geom) for non-interactive map display in all
-    three probe_explorer map views (Overview, IFK, Raster-Karten) — a
-    "Prozessquellen" toggle layer, off by default, unlike Gold-Kacheln.
-    Static reference data (Xurce delivery, not part of the gold pipeline) —
-    unlike load_kachel_coverage this never changes as the campaign
-    progresses, so callers can cache it indefinitely (see app.py's
-    st.cache_data wrapper) rather than on a refresh interval.
-
-    Returns {'polygons': FeatureCollection, 'labels': FeatureCollection} —
-    'labels' is one ST_PointOnSurface point per id_pq (guaranteed to fall
-    INSIDE the polygon, unlike a centroid which can land outside for a
-    concave shape), for the zoom-gated small-number-label symbol layer.
-    Both built from ONE S3 read + reprojection pass, not two.
-
-    Same ST_Transform(..., always_xy := true) WGS84-reprojection pattern
-    get_anriss_hull_fragment already uses — the source geom column is LV95
-    (its GeoParquet metadata mislabels it OGC:CRS84, a known gotcha fixed
-    in the file itself 2026-08-20, see project docs) like everything else
-    in this module, reprojected only on the way out since this value is
-    only ever consumed as a web-map overlay."""
-    con = _s3_derivate_connection()
-    try:
-        rows = con.execute(f"""
-            SELECT id_pq,
-                   ST_AsGeoJSON(ST_Transform(geom, 'EPSG:2056', 'EPSG:4326', always_xy := true)) AS poly_json,
-                   ST_AsGeoJSON(ST_Transform(ST_PointOnSurface(geom), 'EPSG:2056', 'EPSG:4326', always_xy := true)) AS label_json
-            FROM read_parquet('s3://{S3_BUCKET_INPUT}/prozessquelle.parquet')
-        """).fetchall()
-    finally:
-        con.close()
-    polygons, labels = [], []
-    for id_pq, poly_json, label_json in rows:
-        polygons.append({"type": "Feature", "properties": {"id_pq": int(id_pq)}, "geometry": json.loads(poly_json)})
-        labels.append({"type": "Feature", "properties": {"id_pq": int(id_pq)}, "geometry": json.loads(label_json)})
-    return {
-        "polygons": {"type": "FeatureCollection", "features": polygons},
-        "labels": {"type": "FeatureCollection", "features": labels},
-    }
 
 
 def count_simulations() -> int:

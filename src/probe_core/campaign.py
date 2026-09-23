@@ -20,11 +20,7 @@ PHYSICS_GRID = {
 # = jobs.yaml defaults.batch_size
 EVENTS_PER_BATCH = 100
 
-# The upfront simulation plan (every anriss, simulated or not): its key in the
-# input bucket.  = basename of jobs.yaml silver_to_gold.manifest
+# The upfront simulation plan (every anriss, simulated or not): its key at the
+# gold bucket's root (a copy of the fleet's input/ original).  = basename of
+# jobs.yaml silver_to_gold.manifest
 EVENT_MANIFEST_KEY = "maxi_event_manifest.parquet"
-
-# Default name of the bucket holding static reference inputs (event manifest,
-# prozessquelle.parquet, downloadable files); PROBE_S3_BUCKET_INPUT overrides it.
-# = infra.yaml s3.input_bucket
-DEFAULT_INPUT_BUCKET = "input"

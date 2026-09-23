@@ -42,7 +42,6 @@ environment is read when a value is used:
 | `PROBE_S3_ENDPOINT_URL` | `https://f712.gos3.io` | S3 endpoint |
 | `HOSTTECH_BERLIN_OBJECT_STORAGE_ACCESS_KEY` / `_KEY_SECRET` | — | S3 credentials |
 | `PROBE_S3_BUCKET_GOLD` | `maxi` | gold / derivate bucket |
-| `PROBE_S3_BUCKET_INPUT` | `input` | static reference inputs |
 | `PROBE_LOCAL_STATE_DIR` | `~/probe_explorer/local_state` | local catalog / manifest indexes |
 | `PROBE_DUCKDB_MAX_TEMP_SIZE` | DuckDB's own | cap for DuckDB spill files |
 | `https_proxy`, `http_proxy`, `no_proxy` | — | egress proxy, also applied to DuckDB |

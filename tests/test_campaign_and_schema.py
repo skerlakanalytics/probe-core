@@ -13,14 +13,14 @@ def test_campaign_values():
     assert campaign.EVENT_MANIFEST_KEY == "maxi_event_manifest.parquet"
 
 
-def test_input_bucket_default_and_override(monkeypatch):
-    monkeypatch.delenv("PROBE_S3_BUCKET_INPUT", raising=False)
+def test_event_manifest_follows_gold_bucket(monkeypatch):
+    monkeypatch.delenv("PROBE_S3_BUCKET_GOLD", raising=False)
     di = importlib.reload(data_interface)
-    assert di.EVENT_MANIFEST_S3_URI == "s3://input/maxi_event_manifest.parquet"
-    monkeypatch.setenv("PROBE_S3_BUCKET_INPUT", "other-input")
+    assert di.EVENT_MANIFEST_S3_URI == "s3://maxi/maxi_event_manifest.parquet"
+    monkeypatch.setenv("PROBE_S3_BUCKET_GOLD", "adelboden-test")
     di = importlib.reload(data_interface)
-    assert di.EVENT_MANIFEST_S3_URI == "s3://other-input/maxi_event_manifest.parquet"
-    monkeypatch.delenv("PROBE_S3_BUCKET_INPUT")
+    assert di.EVENT_MANIFEST_S3_URI == "s3://adelboden-test/maxi_event_manifest.parquet"
+    monkeypatch.delenv("PROBE_S3_BUCKET_GOLD")
     importlib.reload(data_interface)
 
 
