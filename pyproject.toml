@@ -1,6 +1,6 @@
 [project]
 name = "probe-core"
-version = "0.1.0"
+version = "0.2.0"
 description = "Shared S3 access, data-lake schema and read layer, and derivate computations of the Pro-BE Äxplorer / MAXI projects"
 readme = "README.md"
 authors = [
