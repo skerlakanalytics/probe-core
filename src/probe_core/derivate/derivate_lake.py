@@ -30,6 +30,7 @@ from probe_core.data_lake.data_lake_schema import (
     DATA_LAKE_DIR_DERIVATE, DATA_LAKE_SUBDIR_MOSAIC,
     DERIVATE_METRIC_RETURN_PERIOD, DERIVATE_METRIC_INTENSITY, DERIVATE_METRIC_HIT_RATE,
     DERIVATE_METRIC_COMBINED_HIT_RATE, DERIVATE_METRIC_SIM_COUNT, DERIVATE_METRIC_AFFECTED_MASK,
+    DERIVATE_METRIC_START_RATE,
 )
 from probe_core.derivate.maxi_ifk_and_raster import _selection_tags, normalize_selection, selection_bounds
 from probe_core.s3 import get_s3_client, s3_key_exists, s3_presigned_url
@@ -42,6 +43,7 @@ PARTITION_KEYS = {
     DERIVATE_METRIC_COMBINED_HIT_RATE: 'combo',
     DERIVATE_METRIC_AFFECTED_MASK: None,
     DERIVATE_METRIC_SIM_COUNT: None,
+    DERIVATE_METRIC_START_RATE: None,
 }
 UNIT_FILE_STEM = 'data'                  # <unit_kind>=<id>/data.<ext>
 KACHEL_FILENAME = f'{UNIT_FILE_STEM}.tif'
@@ -149,10 +151,16 @@ def combined_hit_rate_columns(name: str) -> tuple[str, str]:
     return f"{name}_hitrate", f"{name}_hitrate80y"
 
 
+def start_rate_column(min_h_m) -> str:
+    """0.5 -> 'h_0_5m_startrate': rate (#/year) of anriss starts with release thickness h >= 0.5 m."""
+    return f"h_{fmt_num(min_h_m)}m_startrate"
+
+
 _VARS_RE = '|'.join(VAR_UNIT_SLUG)
 _SLUGS_RE = '|'.join(sorted(VAR_UNIT_SLUG.values(), key=len, reverse=True))
 _THRESHOLD_BAND = re.compile(rf'^(?P<variable>{_VARS_RE})_(?P<value>[0-9_]+)(?:{_SLUGS_RE})_(?:rp|hitrate)$')
 _INTENSITY_BAND = re.compile(rf'^(?P<variable>{_VARS_RE})_rp(?P<value>[0-9_]+)y$')
+_START_RATE_BAND = re.compile(r'^h_(?P<value>[0-9_]+)m_startrate$')
 
 
 def _slug_to_number(s: str) -> float:
@@ -164,6 +172,7 @@ def parse_band(metric: str, name: str | None) -> dict:
     return_period / hit_rate: {'threshold': 0.25}   (in the variable's display unit: m, m/s, kPa)
     intensity:                {'return_period': 100}
     combined_hit_rate:        {'stat': 'rate'} or {'stat': 'p80'}
+    start_rate:               {'min_h': 0.5}   (m)
     affected_mask / sim_count: {}
     Raises ValueError for a name that doesn't match the metric's naming scheme."""
     if metric in (DERIVATE_METRIC_RETURN_PERIOD, DERIVATE_METRIC_HIT_RATE):
@@ -179,6 +188,10 @@ def parse_band(metric: str, name: str | None) -> dict:
             return {'stat': 'p80'}
         if name and name.endswith('_hitrate'):
             return {'stat': 'rate'}
+    elif metric == DERIVATE_METRIC_START_RATE:
+        m = _START_RATE_BAND.match(name or '')
+        if m:
+            return {'min_h': _slug_to_number(m['value'])}
     elif metric in (DERIVATE_METRIC_AFFECTED_MASK, DERIVATE_METRIC_SIM_COUNT):
         return {}
     raise ValueError(f"{metric}: unrecognized band name {name!r}")
