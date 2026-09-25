@@ -60,7 +60,16 @@ DATA_LAKE_DIR_QA_RESULTS = "Data-Lake-QA-Results"
 # lookup and derivate/build_hull_fragments.py for the incremental per-range
 # one data_interface.py's get_anriss_hull_fragment() reads.
 DATA_LAKE_DIR_DERIVATE = "Data-Lake-Derivate"
-DATA_LAKE_DIR_DERIVATE_HULLS = f"{DATA_LAKE_DIR_DERIVATE}/anriss_umhuellende"
+# Metric folder names (one top-level folder per derivate metric under the derivate root; the
+# producers in derivate/producers/ name their Outputs with these):
+DERIVATE_METRIC_RETURN_PERIOD = "return_period"
+DERIVATE_METRIC_INTENSITY = "intensity"
+DERIVATE_METRIC_HIT_RATE = "hit_rate"          # Trefferhäufigkeit: annual rate at a fixed threshold (= 1/return_period, but persisted directly rather than inverted)
+DERIVATE_METRIC_COMBINED_HIT_RATE = "combined_hit_rate"  # Trefferhäufigkeit for an AND across variables (e.g. depth>0.1m AND pressure>=3kPa): annual rate + 80y Poisson probability
+DERIVATE_METRIC_SIM_COUNT = "sim_count"        # unweighted count of simulation rows reaching a pixel, no probability/threshold
+DERIVATE_METRIC_AFFECTED_MASK = "affected_mask"
+DERIVATE_METRIC_ANRISS_UMHUELLENDE = "anriss_umhuellende"
+DATA_LAKE_DIR_DERIVATE_HULLS = f"{DATA_LAKE_DIR_DERIVATE}/{DERIVATE_METRIC_ANRISS_UMHUELLENDE}"
 # Batch-precomputed return-period/intensity raster derivate (derivate/build_raster_derivate.py),
 # Hive-partitioned by a config-hash prefix then id_kachel — see that module's
 # docstring for why the config hash is part of the path (no ledger; a changed
@@ -73,7 +82,24 @@ DATA_LAKE_DIR_DERIVATE_RASTER = f"{DATA_LAKE_DIR_DERIVATE}/raster"
 # mosaic, same gdalbuildvrt approach as the raster derivate's canton_mosaic. No
 # config hash (there's nothing to configure) — a flat prefix, not Hive-partitioned
 # by id_kachel like DERIVATE_RASTER (see build_affected_mask.py's docstring).
-DATA_LAKE_DIR_DERIVATE_AFFECTED_MASK = f"{DATA_LAKE_DIR_DERIVATE}/affected_mask"
+DATA_LAKE_DIR_DERIVATE_AFFECTED_MASK = f"{DATA_LAKE_DIR_DERIVATE}/{DERIVATE_METRIC_AFFECTED_MASK}"
+# 2026-09-19 derivate rework (derivate/run_derivate.py + derivate/producers/):
+# every derivate metric gets its OWN top-level folder under Data-Lake-Derivate,
+# Hive-partitioned by its params then its unit (id_kachel or batch_range) --
+#   Data-Lake-Derivate/<metric>/<param>=<value>/.../id_kachel=<id>/data.tif
+# No config hash (a changed matrix adds/overwrites files, git history + --force
+# is the versioning story). raster/cfg_<hash>/ above is the LEGACY layout, kept
+# only as the migration source (derivate/migrate_raster_derivate_layout.py)
+# until the explorer has switched over and it is deleted with approval.
+DATA_LAKE_DIR_DERIVATE_RETURN_PERIOD = f"{DATA_LAKE_DIR_DERIVATE}/{DERIVATE_METRIC_RETURN_PERIOD}"
+DATA_LAKE_DIR_DERIVATE_INTENSITY = f"{DATA_LAKE_DIR_DERIVATE}/{DERIVATE_METRIC_INTENSITY}"
+# Underscore-prefixed siblings of the Hive partition dirs, so a hive_partitioning
+# glob over <metric>/ never trips over them:
+#   <metric>/_mosaic/<param>=<value>/canton.tif (+ canton_bands.json)
+DATA_LAKE_SUBDIR_MOSAIC = "_mosaic"
+# Work-claim locks of the multi-node derivate runner (derivate/derivate_lock.py):
+#   <derivate root>/_locks/<producer>/<unit_kind>=<id>.lock
+DATA_LAKE_SUBDIR_LOCKS = "_locks"
 
 # Compacted Run-Logs-Results (data_lake/compact_run_logs_results.py,
 # 2026-09-15): DATA_LAKE_DIR_RUN_LOGS_RESULTS has 2 files per batch (a
@@ -231,25 +257,25 @@ def gebaeudeschatten_gold_sim_anriss_dir(reach_m: int) -> str:
     return f"{DATA_LAKE_DIR_GEBAEUDESCHATTEN_GOLD}/{gebaeudeschatten_gold_reach_dir(reach_m)}/SIM_ANRISS"
 
 
-# Building-polygon manifest (ingestion output, one row per release polygon
-# across every auto-discovered starts_* layer -- see pre_processing/
-# ingest_gebaeudeschatten_starts.py). id_start is campaign-wide unique, built
-# from a hash of (layer_name, ORIG_FID) rather than a hand-maintained
-# municipality code, so a future delivery with new municipality layers needs
-# no registration step -- decision Bojan 2026-09-04, and it's fine for these
-# IDs to differ between this pilot and any later full-canton rebuild since
-# the manifest is the only place they're defined (no cross-run identity to
-# preserve). x_start/y_start are the release polygon's centroid, kept
-# alongside its full geometry (WKB) for tooling that only needs a point (DEM
-# cache keying, coarse spatial filters); geometry itself is what's actually
-# rasterized into the release area, not a circle derived from area.
+# Building-polygon manifest (ingestion output, one row per release polygon of the
+# delivery's ONE polygon layer -- see pre_processing/ingest_gebaeudeschatten_starts.py).
+# id_start is campaign-wide unique because it IS the layer's fid (OGR/FileGDB row id,
+# unique per row within a layer -- hence exactly one layer per delivery); no hash, no
+# municipality code table. Decision Bojan 2026-09-21: it's fine for these IDs to differ
+# between deliveries since the manifest is the only place they're defined (no cross-run
+# identity to preserve; the full-canton delivery replaced the two-municipality pilot and
+# every id_start changed). x_start/y_start are the release polygon's
+# centroid, kept alongside its full geometry (WKB) for tooling that only needs
+# a point (DEM cache keying, coarse spatial filters); geometry itself is what's
+# actually rasterized into the release area, not a circle derived from area.
 GEBAEUDESCHATTEN_MANIFEST_SCHEMA_DUCKDB = {
     "id_start": "BIGINT",
-    "layer": "VARCHAR",       # source gdb layer, e.g. "starts_krauchtal"
-    "orig_fid": "INTEGER",    # ORIG_FID within that layer -- NOT unique: geo7's
-                              # -2m buffer can split one building into several
-                              # disjoint polygons sharing the same ORIG_FID
-                              # (confirmed 2026-09-04); id_start disambiguates
+    "layer": "VARCHAR",       # source gdb layer, e.g. "TLM_Gebaeude_minus2m_sp"
+    "fid": "INTEGER",         # OGR/FileGDB row id (OBJECTID) within that layer --
+                              # unique per row by construction (the pilot's
+                              # ORIG_FID data column was NOT: geo7's -2m buffer
+                              # could split one building into several polygons
+                              # sharing it; replaced 2026-09-21)
     "area": "DOUBLE",         # m^2, from the polygon geometry itself (SHAPE_Area)
     "x_start": "DOUBLE",      # polygon centroid
     "y_start": "DOUBLE",
