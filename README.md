@@ -6,7 +6,9 @@ schema and read layer, and the derivate computations (IFK, rasters, event export
 Used by:
 
 - [`pgr-atlas`](https://github.com/skerlakanalytics/pgr-atlas) — the Streamlit app
-- `ProBE_control_center` — the simulation and data-lake pipeline
+- `ProBE_control_center` — the simulation and data-lake pipeline (since 2026-09-25 for
+  `data_lake_schema`, `maxi_ifk_and_raster` and `derivate_lake`; its `data_interface` is
+  still its own copy)
 
 Both depend on a tagged version of this package, e.g.
 
@@ -30,7 +32,8 @@ Extracted on 2026-09-18 from `pgr-atlas` (`app/probe_control_center/`, commit
 | `probe_core.campaign` | facts about the MAXI data: physics grid, events per batch, manifest key |
 | `probe_core.data_lake.data_lake_schema` | lake layout, column names, constants (reads `data/cfgCom1DFA_template.ini`) |
 | `probe_core.data_lake.data_interface` | read layer: gold, catalog, hull fragments, stats |
-| `probe_core.derivate.*` | IFK and rasters, event export, raster derivate (+ canton mosaic) |
+| `probe_core.derivate.maxi_ifk_and_raster`, `maxi_event_export` | IFK and on-demand rasters, event export |
+| `probe_core.derivate.derivate_lake` | read side of the derivate lake (`Data-Lake-Derivate/<metric>/…`, written by the pipeline's `derivate/run_derivate.py`): paths, band-name parsing, S3 discovery, cropping a canton mosaic to a selection |
 
 ## Configuration
 
@@ -59,8 +62,7 @@ first S3 call); the former `utils.py` did it on import.
 | `from data_lake.data_lake_schema import …` | `from probe_core.data_lake.data_lake_schema import …` |
 | `from derivate.<module> import …` | `from probe_core.derivate.<module> import …` |
 | `probe_config.load_config()` / `app.yaml` values | `probe_core.campaign` constants and the variables above |
-| `python derivate/build_raster_derivate.py …` | CLI stays in ProBE_control_center (reads its `jobs.yaml`), calling `run_pass` from here; needs `probe-core[ray]` |
-| `python derivate/build_raster_derivate_mosaic.py …` | `python -m probe_core.derivate.build_raster_derivate_mosaic …` |
+| `probe_core.derivate.build_raster_derivate`, `build_raster_derivate_mosaic` (legacy `raster/cfg_<hash>/` layout) | removed in 0.3.0; the pipeline writes derivates with `derivate/run_derivate.py`, readers use `probe_core.derivate.derivate_lake` |
 
 A consumer can switch gradually by turning its old modules into thin forwarders,
 e.g. the pipeline's `utils.py` keeping its Ray helpers and re-exporting

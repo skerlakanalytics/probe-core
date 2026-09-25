@@ -12,8 +12,7 @@ MODULES = [
     "probe_core.data_lake.data_interface",
     "probe_core.derivate.maxi_event_export",
     "probe_core.derivate.maxi_ifk_and_raster",
-    "probe_core.derivate.build_raster_derivate",
-    "probe_core.derivate.build_raster_derivate_mosaic",
+    "probe_core.derivate.derivate_lake",
 ]
 
 

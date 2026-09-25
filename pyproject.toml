@@ -1,6 +1,6 @@
 [project]
 name = "probe-core"
-version = "0.2.0"
+version = "0.3.0"
 description = "Shared S3 access, data-lake schema and read layer, and derivate computations of the Pro-BE Äxplorer / MAXI projects"
 readme = "README.md"
 authors = [
@@ -15,15 +15,11 @@ dependencies = [
     "duckdb>=1.4,<2",
     "geopandas>=1.0,<2",
     "numpy>=1.26,<3",
-    "pandas>=2.2,<3",
+    "pandas>=2.2,<4",   # the pipeline runs pandas 3
     "psutil>=5.9",
     "rasterio>=1.4,<2",
     "shapely>=2.0,<3",
 ]
-
-[project.optional-dependencies]
-# Only the raster-derivate batch driver (run_pass/_run_pool) uses Ray.
-ray = ["ray>=2.40"]
 
 [build-system]
 requires = ["uv_build>=0.12.13,<0.13.0"]
