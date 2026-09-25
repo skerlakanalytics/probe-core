@@ -67,6 +67,7 @@ DERIVATE_METRIC_INTENSITY = "intensity"
 DERIVATE_METRIC_HIT_RATE = "hit_rate"          # Trefferhäufigkeit: annual rate at a fixed threshold (= 1/return_period, but persisted directly rather than inverted)
 DERIVATE_METRIC_COMBINED_HIT_RATE = "combined_hit_rate"  # Trefferhäufigkeit for an AND across variables (e.g. depth>0.1m AND pressure>=3kPa): annual rate + 80y Poisson probability
 DERIVATE_METRIC_SIM_COUNT = "sim_count"        # unweighted count of simulation rows reaching a pixel, no probability/threshold
+DERIVATE_METRIC_START_RATE = "start_rate"      # Häufigkeit of anriss starts per pixel: rate (#/year) of starts with h >= a threshold whose release circle covers the pixel
 DERIVATE_METRIC_AFFECTED_MASK = "affected_mask"
 DERIVATE_METRIC_ANRISS_UMHUELLENDE = "anriss_umhuellende"
 DATA_LAKE_DIR_DERIVATE_HULLS = f"{DATA_LAKE_DIR_DERIVATE}/{DERIVATE_METRIC_ANRISS_UMHUELLENDE}"

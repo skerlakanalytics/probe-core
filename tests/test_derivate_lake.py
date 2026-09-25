@@ -15,6 +15,7 @@ def test_paths():
     assert dl.kachel_key("combined_hit_rate", 1, "depth01_pressure3") == \
         "Data-Lake-Derivate/combined_hit_rate/combo=depth01_pressure3/id_kachel=1/data.tif"
     assert dl.kachel_key("sim_count", 1) == "Data-Lake-Derivate/sim_count/id_kachel=1/data.tif"
+    assert dl.kachel_key("start_rate", 1) == "Data-Lake-Derivate/start_rate/id_kachel=1/data.tif"
     assert dl.mosaic_key("intensity", "velocity") == "Data-Lake-Derivate/intensity/_mosaic/variable=velocity/canton.tif"
     assert dl.mosaic_stats_key("affected_mask") == "Data-Lake-Derivate/affected_mask/_mosaic/canton_bands.json"
 
@@ -36,6 +37,8 @@ def test_partition_required_or_forbidden():
     ("combined_hit_rate", "depth01_pressure3_hitrate", {"stat": "rate"}),
     ("combined_hit_rate", "depth01_pressure3_hitrate80y", {"stat": "p80"}),
     ("sim_count", None, {}),
+    ("start_rate", "h_0_5m_startrate", {"min_h": 0.5}),
+    ("start_rate", "h_1m_startrate", {"min_h": 1.0}),
 ])
 def test_parse_band(metric, name, expected):
     assert dl.parse_band(metric, name) == expected
@@ -87,3 +90,9 @@ def test_generic_hive_paths_with_root():
     assert dl.hive_mosaic_prefix("m", (), "Scratch") == "Scratch/m/_mosaic"
     assert dl.hive_unit_key("anriss_umhuellende", (), "batch_range", 3, "parquet") == \
         "Data-Lake-Derivate/anriss_umhuellende/batch_range=3/data.parquet"
+
+
+@pytest.mark.parametrize("min_h", [0.5, 0.75, 1.0, 2.0])
+def test_start_rate_band_roundtrip(min_h):
+    assert dl.start_rate_column(min_h) == f"h_{dl.fmt_num(min_h)}m_startrate"
+    assert dl.parse_band("start_rate", dl.start_rate_column(min_h)) == {"min_h": min_h}
