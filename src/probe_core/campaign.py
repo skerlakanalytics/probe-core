@@ -24,3 +24,12 @@ EVENTS_PER_BATCH = 100
 # gold bucket's root (a copy of the fleet's input/ original).  = basename of
 # jobs.yaml silver_to_gold.manifest
 EVENT_MANIFEST_KEY = "maxi_event_manifest.parquet"
+
+# The event catalog (2026-09-27): the manifest re-sorted by id_anriss with the
+# columns the app looks up per anriss, plus the precomputed catalog totals.
+# Built once by ProBE_control_center's data_lake/build_event_catalog.py and
+# stored next to the manifest at the gold bucket's root. Replaces the app's
+# local catalog.db (the manifest is sorted by sort_key, so a per-anriss lookup
+# against it can't skip row groups; this copy can).
+EVENT_CATALOG_KEY = "maxi_event_catalog.parquet"
+EVENT_CATALOG_STATS_KEY = "maxi_event_catalog_stats.json"
