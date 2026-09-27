@@ -49,8 +49,8 @@ environment is read when a value is used:
 | `https_proxy`, `http_proxy`, `no_proxy` | — | egress proxy, also applied to DuckDB |
 
 No local state: per-anriss lookups and the catalog totals come from the event
-catalog at the gold bucket's root (`maxi_event_catalog.parquet`, sorted by
-`id_anriss`, and `maxi_event_catalog_stats.json`, built by ProBE_control_center's
+catalog at the gold bucket's root (`maxi_event_manifest_by_id_anriss.parquet`, sorted by
+`id_anriss`, and `maxi_event_manifest_stats.json`, built by ProBE_control_center's
 `data_lake/build_event_catalog.py`), and the finalized gold kacheln are listed
 from S3 into memory (once, on first use or `refresh_gold_manifest()`). Until
 2026-09-27 both were local DuckDB files under `PROBE_LOCAL_STATE_DIR`.

@@ -31,5 +31,5 @@ EVENT_MANIFEST_KEY = "maxi_event_manifest.parquet"
 # stored next to the manifest at the gold bucket's root. Replaces the app's
 # local catalog.db (the manifest is sorted by sort_key, so a per-anriss lookup
 # against it can't skip row groups; this copy can).
-EVENT_CATALOG_KEY = "maxi_event_catalog.parquet"
-EVENT_CATALOG_STATS_KEY = "maxi_event_catalog_stats.json"
+EVENT_CATALOG_KEY = "maxi_event_manifest_by_id_anriss.parquet"
+EVENT_CATALOG_STATS_KEY = "maxi_event_manifest_stats.json"
