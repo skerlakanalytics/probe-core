@@ -12,6 +12,7 @@ data_interface.py's module docstring — pending the enrich phase).
 
 import io
 import json
+import os
 from pathlib import Path
 
 import geopandas as gpd
@@ -24,8 +25,10 @@ from shapely.geometry import shape
 
 PIXEL_SIZE = 5
 CRS_LV95 = "EPSG:2056"
-CACHE_DIR = Path("~/probe_explorer/.cache_maxi").expanduser()
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+# Envelope cache (one GeoJSON per event). PROBE_CACHE_DIR overrides the
+# location (the Bedag stages mount a volume at the default). Created on first
+# write, not on import -- importing this module has no side effects.
+CACHE_DIR = Path(os.getenv("PROBE_CACHE_DIR") or "~/probe_explorer/.cache_maxi").expanduser()
 
 
 def event_layer_geotiff_bytes(df: pd.DataFrame, col: str) -> bytes:
@@ -92,6 +95,11 @@ def export_event_envelope_geojson(df: pd.DataFrame, id_anriss: int):
         crs=CRS_LV95
     )
 
-    envelope_gdf_lv95.to_file(str(cache_path), driver='GeoJSON')
+    # Atomic: an interrupted write must not leave a truncated file at
+    # cache_path, whose mere existence is trusted above.
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
+    envelope_gdf_lv95.to_file(str(tmp_path), driver='GeoJSON')
+    os.replace(tmp_path, cache_path)
     geojson_data = json.loads(envelope_gdf_lv95.to_crs('EPSG:4326').to_json())
     return geojson_data, str(cache_path)
