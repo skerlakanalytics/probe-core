@@ -19,14 +19,14 @@ MODULES = [
 def test_import_has_no_side_effects(tmp_path):
     """Run in a fresh interpreter: module caching in this test process would
     hide import-time effects of modules other tests already imported."""
-    state_dir = tmp_path / "state"
     code = (
         "import importlib, sys\n"
         f"for m in {MODULES!r}: importlib.import_module(m)\n"
         "assert 'ray' not in sys.modules, 'ray imported at module level'\n"
         "assert 'dotenv' not in sys.modules, 'dotenv imported at module level'\n"
     )
-    env = {"PROBE_LOCAL_STATE_DIR": str(state_dir), "PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}
     result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    assert not state_dir.exists(), "local state dir must be created on first use, not on import"
+    assert not (tmp_path / "probe_explorer" / "local_state").exists(), \
+        "no local state since 2026-09-27 (catalog and gold manifest come from S3)"

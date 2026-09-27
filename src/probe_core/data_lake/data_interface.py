@@ -51,17 +51,17 @@ import math
 import os
 import shutil
 import threading
-import time
 from functools import lru_cache
 from pathlib import Path
 
 import duckdb
 import geopandas as gpd
 import pandas as pd
+from pyproj import Transformer
 from shapely.geometry import box
 
 from probe_core.campaign import (
-    EVENT_MANIFEST_KEY, EVENTS_PER_BATCH, PHYSICS_GRID,
+    EVENT_CATALOG_KEY, EVENT_CATALOG_STATS_KEY, EVENT_MANIFEST_KEY, EVENTS_PER_BATCH, PHYSICS_GRID,
 )
 from probe_core.data_lake.data_lake_schema import (
     BATCH_SILVER_S3_SUFFIX, DATA_LAKE_DIR_SILVER, DATA_LAKE_DIR_GOLD_SIM_SPATIAL,
@@ -74,7 +74,7 @@ from probe_core.resources import (  # noqa: F401
     container_cpu_limit, container_memory_limit_bytes,
     duckdb_max_temp_directory_size, safe_duckdb_memory_limit,
 )
-from probe_core.s3 import configure_s3_for_duckdb
+from probe_core.s3 import configure_s3_for_duckdb, get_s3_client
 
 # ── CONFIGURATION ────────────────────────────────────────────────────────────
 CRS_LV95 = "EPSG:2056"
@@ -90,47 +90,24 @@ _PHYSICS_GRID = list(itertools.product(_maxi_params["mu"], _maxi_params["xsi"], 
 # needed by _hull_fragment_s3_key below to compute an id_anriss's batch/range
 # straight from arithmetic, matching the campaign's actual batching.
 
-# Local state for probe_explorer's app-level caches (catalog index, gold
-# finalize manifest). This module's CODE lives in probe_control_center now,
-# but the cache DATA stays where the Streamlit app already built it up, so
-# consolidating the code doesn't force a rescan of S3 / rebuild of the
-# catalog on the app's next start. Derived from the runtime user's home
-# (not hardcoded to "bojan") since this module is also imported by fleet
-# scripts (e.g. derivate/build_hull_fragments.py, deployed as user `probe`)
-# that only need this file's non-catalog functions — parents=True because
-# `probe_explorer/` legitimately doesn't exist there, and this cache is
-# never populated on that host anyway.
-# PROBE_LOCAL_STATE_DIR overrides the location; the directory is created on
-# first use (_connect_local_db_with_retry), not on import.
-LOCAL_STATE_DIR = Path(os.getenv("PROBE_LOCAL_STATE_DIR")
-                       or Path.home() / "probe_explorer" / "local_state")
-CATALOG_DB_PATH       = str(LOCAL_STATE_DIR / "catalog.db")
-GOLD_MANIFEST_DB_PATH = str(LOCAL_STATE_DIR / "gold_manifest.db")
-
 S3_BUCKET_GOLD = os.getenv("PROBE_S3_BUCKET_GOLD", "maxi")
-# Upfront simulation plan (not gold — this exists before any simulation
-# runs) — the 540MB, 61.3M-row manifest, read straight off S3 (same
-# httpfs/read_parquet pattern as the gold reads), never
-# downloaded/cached locally. It's only ever read in full once per process,
-# by get_catalog_con() below to build the local catalog.db index — every
-# other function in this module (get_event_params, id_anriss_exists,
-# _hull_fragment_s3_key, _sim_anriss_s3_key, the catalog stats) reads that
-# index instead of this file, specifically because the manifest is
-# physically sorted by sort_key (SW->NE batch sweep), not id_anriss, so a
-# per-call `WHERE id_anriss = ?` against it can't prune row groups and ends
-# up scanning most of the file regardless of whether it's local or remote
-# -- the fix is building the index once, not caching the raw file (2026-09-18:
-# this module used to download+cache it locally at import time; dropped
-# after confirming every read site had already been, or could be, migrated
-# to the catalog.db index -- see git history if the old download path is
-# ever needed as a reference).
-# Read from the GOLD bucket's root, not the `input` bucket (2026-09-23): a
-# byte-identical copy of input/maxi_event_manifest.parquet lives at the root
-# of both `maxi` and `adelboden-test`, so the app's data comes from one bucket
-# and its S3 key doesn't need `input` access. The fleet keeps reading the
-# `input` original during provisioning -- if the manifest is ever re-issued,
-# re-copy it to both gold buckets.
+# Upfront simulation plan (not gold -- it exists before any simulation runs):
+# the 540 MB, 122.6M-row manifest at the gold bucket's root (a copy of the
+# fleet's input/ original; re-copy it to both gold buckets if it is ever
+# re-issued). Physically sorted by sort_key (SW->NE batch sweep), so a
+# per-anriss `WHERE id_anriss = ?` against it can't skip row groups -- this
+# module never reads it; per-anriss lookups go to the event catalog below.
 EVENT_MANIFEST_S3_URI = f"s3://{S3_BUCKET_GOLD}/{EVENT_MANIFEST_KEY}"
+
+# Event catalog (2026-09-27, replaces the local catalog.db): the manifest's
+# rows re-sorted by id_anriss (id_anriss, id_prozessquelle, x_anriss,
+# y_anriss, d, A, h, h_type, sort_key) with small row groups, so a lookup
+# reads the footer (cached per process) and one row group; plus a small JSON
+# of precomputed totals (manifest rows, distinct anrisse/areas/prozessquellen,
+# map centre, per home-kachel counts and values). Both are built once by
+# ProBE_control_center's data_lake/build_event_catalog.py -- rebuild them
+# whenever the manifest changes.
+EVENT_CATALOG_S3_URI = f"s3://{S3_BUCKET_GOLD}/{EVENT_CATALOG_KEY}"
 
 # All reads in this module are against SIM_SPATIAL (bbox/pixel access) — the
 # SIM_ANRISS cousin (data_lake/build_silver_to_gold_anriss.py) has no reader here
@@ -356,30 +333,6 @@ def _s3_derivate_connection() -> duckdb.DuckDBPyConnection:
     return con
 
 
-def _connect_local_db_with_retry(path: str) -> duckdb.DuckDBPyConnection:
-    """duckdb.connect(path) for one of this module's LOCAL state files
-    (catalog.db, gold_manifest.db) -- these take an exclusive file lock, so
-    any second OS process opening the same path (a one-off diagnostic
-    script, a redeploy's old process not yet fully gone) gets a hard
-    `duckdb.IOException: Could not set lock on file`, even though the
-    holder is typically transient (2026-08-11: hit this for real running a
-    throwaway script alongside a live Streamlit process). Both call sites
-    are once-per-process @lru_cache singletons, so a short retry here is
-    enough to ride out a transient competing process instead of crashing
-    the whole session on the very first query."""
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    delay = 0.5
-    for attempt in range(6):
-        try:
-            return duckdb.connect(path)
-        except duckdb.IOException:
-            if attempt == 5:
-                raise
-            time.sleep(delay)
-            delay *= 2
-    raise AssertionError("unreachable")
-
-
 def _thread_local_cursor(tls: threading.local, base_con: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyConnection:
     """One duckdb cursor per thread, duplicated from base_con via
     con.cursor() -- a plain duckdb.Connection is NOT safe for concurrent
@@ -389,8 +342,8 @@ def _thread_local_cursor(tls: threading.local, base_con: duckdb.DuckDBPyConnecti
     Needed because Streamlit runs each browser session's script on its own
     thread within one server process, so any LOCAL (non-S3) query in this
     module can be hit by multiple users' threads at the same moment --
-    every caller of a cached singleton connection (_gold_manifest_con,
-    get_catalog_con) must go through this instead of using that connection
+    every caller of a cached singleton connection (_catalog_con) must go
+    through this instead of using that connection
     object's .execute() directly."""
     con = getattr(tls, "con", None)
     if con is None:
@@ -399,84 +352,39 @@ def _thread_local_cursor(tls: threading.local, base_con: duckdb.DuckDBPyConnecti
     return con
 
 
-@lru_cache(maxsize=1)
-def _gold_manifest_con() -> duckdb.DuckDBPyConnection:
-    """Local manifest DB (metadata only, not simulation data — safe to
-    cache/reuse, unlike _s3_gold_connection above). Tracks which kacheln are
-    finalized on S3, incrementally updated by refresh_gold_manifest since
-    gold is immutable once finalized. No anriss -> kachel index anymore
-    (removed 2026-08-03) — kachel IDs are a deterministic function of x/y
-    (see kacheln_in_bbox), so which kacheln a query needs never required an
-    index, only which of those kacheln are finalized.
-
-    Internal use only — go through _gold_manifest_cursor() to actually run
-    a query (see _thread_local_cursor for why). memory_limit set explicitly
-    -- see get_catalog_con's docstring (2026-08-24): an unbounded local
-    connection's default buffer-manager sizing (~80% of host RAM) is
-    dangerous under CLAUDE.md's mandatory cgroup wrap for any process
-    touching data-lake-scale local files, even a small metadata DB like this
-    one -- kept consistent with every other local/S3 connection in this
-    module rather than assumed safe because this file happens to be small."""
-    con = _connect_local_db_with_retry(GOLD_MANIFEST_DB_PATH)
-    con.execute(f"SET memory_limit='{safe_duckdb_memory_limit()}'")
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS gold_kacheln (
-            id_kachel BIGINT PRIMARY KEY,
-            scanned_at TIMESTAMP
-        )
-    """)
-    return con
+# Finalized gold kacheln, held in memory (2026-09-27, replaces the local
+# gold_manifest.db). One S3 listing fills it; the app does that once at
+# startup (the MAXI campaign is finished and gold is immutable). Unlike the old
+# "only ever add" database it is a fresh snapshot of S3 on every refresh, so a
+# rebuilt lake can no longer leave phantom kacheln behind.
+_finalized: frozenset[int] | None = None
+_finalized_lock = threading.Lock()
 
 
-_gold_manifest_tls = threading.local()
-
-
-def _gold_manifest_cursor() -> duckdb.DuckDBPyConnection:
-    return _thread_local_cursor(_gold_manifest_tls, _gold_manifest_con())
-
-
-def _finalized_kacheln() -> set[int]:
-    """Kacheln known-finalized per the LOCAL manifest — may lag the true S3
-    state until refresh_gold_manifest() is called again; can only be a
-    stale UNDERcount (finalized kacheln the manifest doesn't know about
-    yet), never an overcount, since kacheln are only ever added, never
-    removed (gold is immutable)."""
-    con = _gold_manifest_cursor()
-    return {r[0] for r in con.execute("SELECT id_kachel FROM gold_kacheln").fetchall()}
+def _finalized_kacheln() -> frozenset[int]:
+    """Kacheln finalized on S3 as of the last refresh_gold_manifest() --
+    refreshes on first use."""
+    if _finalized is None:
+        refresh_gold_manifest()
+    return _finalized
 
 
 def refresh_gold_manifest(progress_callback=None) -> dict:
-    """Scans the production gold lake on S3 and updates the local manifest
-    of finalized kacheln (gold_kacheln) — a plain S3 directory listing, no
-    parquet DATA ever read. Only kacheln not already in the manifest are
-    added; safe and cheap to call repeatedly while the campaign is still
-    filling up the lake.
+    """Lists the production gold lake on S3 (directory listing only, no
+    parquet data read) and replaces the in-memory set of finalized kacheln.
 
-    Used to also build a precise id_anriss -> id_kachel index here, which
-    DID require downloading and scanning every newly-finalized kachel's
-    actual gold data — that was the real cost of this call. Removed
-    2026-08-03: kachel IDs are a deterministic function of x/y (see
-    kacheln_in_bbox), so no query actually needed a maintained index to know
-    which kacheln to read, only which of those are finalized — see
-    _event_relevant_kacheln and gold_coverage_stats, both now derive kacheln
-    straight from x/y instead.
-
-    Returns {'new_kacheln': int, 'total_kacheln': int}."""
-    manifest = _gold_manifest_cursor()
-    known = _finalized_kacheln()
-
+    Returns {'new_kacheln': int, 'total_kacheln': int} -- new = not in the
+    previous snapshot of this process."""
+    global _finalized
     s3 = _s3_gold_connection()
     live_files = s3.execute(f"SELECT file FROM glob('{GOLD_S3_ROOT}/id_kachel=*/data.parquet')").fetchall()
-    live = {int(f[0].split('id_kachel=')[1].split('/')[0]) for f in live_files}
-    new_kacheln = sorted(live - known)
-
-    if new_kacheln:
-        if progress_callback:
-            progress_callback(0, len(new_kacheln), f"{len(new_kacheln):,} neue Kacheln")
-        manifest.executemany("INSERT INTO gold_kacheln VALUES (?, now())", [(k,) for k in new_kacheln])
-        if progress_callback:
-            progress_callback(len(new_kacheln), len(new_kacheln), "Fertig")
-    return {'new_kacheln': len(new_kacheln), 'total_kacheln': len(live)}
+    live = frozenset(int(f[0].split('id_kachel=')[1].split('/')[0]) for f in live_files)
+    with _finalized_lock:
+        new = len(live - (_finalized or frozenset()))
+        _finalized = live
+    if progress_callback:
+        progress_callback(new, new, f"{new:,} neue Kacheln")
+    return {'new_kacheln': new, 'total_kacheln': len(live)}
 
 
 # ── EVENT — everything for one anriss/event (simulation detail view) ─────────
@@ -492,26 +400,19 @@ def _hull_fragment_s3_key(id_anriss: int) -> str | None:
     batch_range_id/batch_range_prefix and build_hull_fragments.py's
     range_batch_ids exactly).
 
-    Reads sort_key from the pre-built catalog.db event_params table (see
-    get_catalog_con), not the raw manifest -- same reasoning as
-    get_event_params: the manifest is sorted by sort_key, not id_anriss, so
-    a per-call `WHERE id_anriss = ?` against it can't prune row groups and
-    ends up scanning most of the 540MB file (2026-09-18: this used to do
-    exactly that, against a locally-cached copy of the manifest -- fixed by
-    routing through the index that already existed for this purpose).
+    Reads sort_key from the id_anriss-sorted event catalog on S3, not the raw
+    manifest: the manifest is sorted by sort_key, so a per-call
+    `WHERE id_anriss = ?` against it can't prune row groups and ends up
+    scanning most of the 540MB file.
 
     Returns None if id_anriss isn't in the manifest at all -- callers should
     fall back to the old glob-scan lookup rather than treat that as
     "not yet scattered", since it may mean the batch-math assumption above
     doesn't hold for this row (defense in depth, not expected in practice --
     id_anriss_exists() already gates every caller before this point)."""
-    row = _catalog_cursor().execute(
-        "SELECT sort_key FROM event_params WHERE id_anriss = ? LIMIT 1",
-        [int(id_anriss)],
-    ).fetchone()
-    if row is None:
+    sort_key = _catalog_sort_key(id_anriss)
+    if sort_key is None:
         return None
-    sort_key = row[0]
     batch_id = (sort_key - 1) // EVENTS_PER_BATCH + 1
     range_id = batch_id // BATCH_RANGE_SIZE
     return f"{DATA_LAKE_DIR_DERIVATE_HULLS}/{batch_range_prefix(range_id)}_umhuellende.parquet"
@@ -717,15 +618,11 @@ def _sim_anriss_s3_key(id_anriss: int) -> str | None:
 
     Returns None if id_anriss isn't in the manifest at all — same "defense
     in depth, not expected in practice" caveat as _hull_fragment_s3_key.
-    Reads catalog.db's event_params.sort_key, not the raw manifest -- see
+    Reads sort_key from the event catalog, not the raw manifest -- see
     _hull_fragment_s3_key's docstring for why."""
-    row = _catalog_cursor().execute(
-        "SELECT sort_key FROM event_params WHERE id_anriss = ? LIMIT 1",
-        [int(id_anriss)],
-    ).fetchone()
-    if row is None:
+    sort_key = _catalog_sort_key(id_anriss)
+    if sort_key is None:
         return None
-    sort_key = row[0]
     batch_id = (sort_key - 1) // EVENTS_PER_BATCH + 1
     range_id = batch_id // BATCH_RANGE_SIZE
     return f"{DATA_LAKE_DIR_GOLD_SIM_ANRISS}/{batch_range_prefix(range_id)}_sim_anriss.parquet"
@@ -793,16 +690,10 @@ def get_event_params(id_anriss: int) -> pd.DataFrame:
     not filtered by what has actually landed in gold yet. Columns match
     gold's names: A, h, d, mu, xsi, tau0, plus x_anriss/y_anriss/h_type.
 
-    Reads the pre-built, id_anriss-ordered event_params catalog table
-    rather than scanning the 540MB manifest parquet per call — the
-    manifest itself is ordered by sort_key (SW->NE batch sweep), not
-    id_anriss, so a raw WHERE id_anriss = ? there can't prune row groups
-    and ends up scanning most of the file."""
-    rows = _catalog_cursor().execute(
-        """SELECT id_anriss, id_prozessquelle, x_anriss, y_anriss, d, "A", h, h_type
-           FROM event_params WHERE id_anriss = ?""",
-        [int(id_anriss)],
-    ).df()
+    Reads the id_anriss-sorted event catalog on S3 rather than the 540MB
+    manifest, which is ordered by sort_key (SW->NE batch sweep) and so
+    can't prune row groups for a WHERE id_anriss = ?."""
+    rows = _catalog_rows(int(id_anriss)).drop(columns="sort_key")
     if rows.empty:
         raise ValueError(f"id_anriss {id_anriss} not in the event manifest")
     grid = pd.DataFrame(_PHYSICS_GRID, columns=["mu", "xsi", "tau0"])
@@ -812,11 +703,9 @@ def get_event_params(id_anriss: int) -> pd.DataFrame:
 # EVENT helpers
 
 def id_anriss_exists(id_anriss: int) -> bool:
-    """LOCAL: whether id_anriss appears in the event manifest (catalog) —
-    a single indexed point lookup, no full-manifest list ever built."""
-    return _catalog_cursor().execute(
-        "SELECT 1 FROM events WHERE id_anriss = ? LIMIT 1", [int(id_anriss)]
-    ).fetchone() is not None
+    """Whether id_anriss appears in the event manifest -- a point lookup in
+    the id_anriss-sorted event catalog on S3."""
+    return _catalog_sort_key(id_anriss) is not None
 
 
 # ── PIXEL — everything for one data-lake pixel (IFK view) ────────────────────
@@ -868,66 +757,17 @@ def get_area_gold_data(bbox: tuple[float, float, float, float]) -> pd.DataFrame:
 # ── CATALOG — events index, counts (LOCAL, manifest-backed, shared by all views)
 
 @lru_cache(maxsize=1)
-def get_catalog_con():
-    """DuckDB with two LOCAL indexes built once from the event manifest (read
-    straight off S3, see EVENT_MANIFEST_S3_URI — never downloaded/cached
-    locally) — the upfront simulation plan, not gold — and persisted in
-    local_state/:
-    - events: deduplicated one row per id_anriss (position/area/source).
-    - event_params: one row per (id_anriss, h_type), i.e. the manifest's own
-      row grain (no DISTINCT) — the columns get_event_params() needs (d, h,
-      h_type), kept separate from events because those vary per h_type and
-      would break events' per-anriss dedup if merged in. Also carries
-      sort_key (not in events, which dedups it away) so
-      _hull_fragment_s3_key/_sim_anriss_s3_key can look it up here instead
-      of re-scanning the manifest per call.
-
-    Internal use only — go through _catalog_cursor() to actually run a
-    query (see _thread_local_cursor for why). The one-time table-creation
-    below is safe to run directly on this shared connection despite that:
-    @lru_cache(maxsize=1) means only one thread ever actually executes this
-    function body, even under concurrent first calls (others block on its
-    internal lock until the winner returns), so it can't race itself.
-    memory_limit set explicitly (2026-08-24: this is the connection that
-    actually builds `events`/`event_params` via CREATE TABLE ... SELECT
-    DISTINCT ... ORDER BY over the full 61.3M-row manifest on a cold
-    checkout -- an unbounded connection here, left open process-wide for the
-    app's whole lifetime via @lru_cache, was the real remaining cause of a
-    cold-page-load stall traced during mobile testing even after the
-    smaller point-lookup connections elsewhere in this module were fixed:
-    two-plus unbounded connections in the same process each defaulting to
-    ~80% of host RAM compounds, so it's not enough to fix only the one that
-    happens to run last)."""
-    con = _connect_local_db_with_retry(CATALOG_DB_PATH)
+def _catalog_con() -> duckdb.DuckDBPyConnection:
+    """One S3 connection for event-catalog lookups, shared by all threads
+    through _catalog_cursor(). Kept open for the process (unlike
+    _s3_gold_connection) so DuckDB's parquet metadata cache keeps the
+    catalog's footer: after the first lookup, one costs a single row-group
+    read."""
+    con = duckdb.connect()
+    con.execute("INSTALL httpfs; LOAD httpfs;")
     con.execute(f"SET memory_limit='{safe_duckdb_memory_limit()}'")
-    con.execute("INSTALL spatial; LOAD spatial;")
-    if con.execute(
-        "SELECT count(*) FROM information_schema.tables WHERE table_name='events'"
-    ).fetchone()[0] == 0:
-        con.execute("INSTALL httpfs; LOAD httpfs;")
-        configure_s3_for_duckdb(con)
-        con.execute(
-            """CREATE TABLE events AS
-               SELECT DISTINCT id_anriss, id_prozessquelle,
-                               x AS x_anriss, y AS y_anriss, anrissflaeche AS "A"
-               FROM read_parquet(?)
-               ORDER BY id_anriss""",
-            [EVENT_MANIFEST_S3_URI],
-        )
-    if con.execute(
-        "SELECT count(*) FROM information_schema.tables WHERE table_name='event_params'"
-    ).fetchone()[0] == 0:
-        con.execute("INSTALL httpfs; LOAD httpfs;")
-        configure_s3_for_duckdb(con)
-        con.execute(
-            """CREATE TABLE event_params AS
-               SELECT id_anriss, id_prozessquelle, x AS x_anriss, y AS y_anriss,
-                      bodengruendigkeit AS d, anrissflaeche AS "A", h_cm AS h, h_type,
-                      sort_key
-               FROM read_parquet(?)
-               ORDER BY id_anriss""",
-            [EVENT_MANIFEST_S3_URI],
-        )
+    con.execute("SET parquet_metadata_cache=true")
+    configure_s3_for_duckdb(con)
     return con
 
 
@@ -935,42 +775,64 @@ _catalog_tls = threading.local()
 
 
 def _catalog_cursor() -> duckdb.DuckDBPyConnection:
-    return _thread_local_cursor(_catalog_tls, get_catalog_con())
+    """This thread's cursor on _catalog_con. DuckDB's SET s3_*/http_proxy are
+    per connection and a cursor is a connection of its own, so every cursor
+    gets the S3 settings again (without them it reads anonymously: 403)."""
+    con = getattr(_catalog_tls, "con", None)
+    if con is None:
+        con = _catalog_con().cursor()
+        configure_s3_for_duckdb(con)
+        _catalog_tls.con = con
+    return con
+
+
+_CATALOG_COLUMNS = ["id_anriss", "id_prozessquelle", "x_anriss", "y_anriss", "d", "A", "h", "h_type", "sort_key"]
+
+
+@lru_cache(maxsize=4096)
+def _catalog_rows(id_anriss: int) -> pd.DataFrame:
+    """The event catalog's rows for one anriss (one per h variant), read once
+    per process: opening an anriss needs its parameters, its existence and the
+    sort_key behind two fragment keys, and each S3 lookup costs ~0.1-0.4 s.
+    The catalog is immutable, so caching can't go stale. Don't mutate the
+    returned frame (callers copy)."""
+    return _catalog_cursor().execute(
+        f"""SELECT {', '.join(f'"{c}"' for c in _CATALOG_COLUMNS)}
+            FROM read_parquet('{EVENT_CATALOG_S3_URI}') WHERE id_anriss = ?""",
+        [int(id_anriss)],
+    ).df()
+
+
+def _catalog_sort_key(id_anriss: int) -> int | None:
+    """id_anriss -> its manifest sort_key (identical for its h variants:
+    both run in the same batch), None if it isn't in the manifest."""
+    rows = _catalog_rows(int(id_anriss))
+    return int(rows["sort_key"].iloc[0]) if len(rows) else None
+
+
+@lru_cache(maxsize=1)
+def _catalog_stats() -> dict:
+    """The precomputed catalog totals (EVENT_CATALOG_STATS_KEY), read once
+    per process. home_kacheln maps each anriss home kachel (the km2 tile of
+    x_anriss/y_anriss) to {n_anriss, n_rows, areas, prozessquellen}."""
+    body = get_s3_client().get_object(Bucket=S3_BUCKET_GOLD, Key=EVENT_CATALOG_STATS_KEY)["Body"].read()
+    stats = json.loads(body)
+    stats["home_kacheln"] = {int(k): v for k, v in stats["home_kacheln"].items()}
+    return stats
 
 
 def catalog_overview_stats() -> dict:
-    """LOCAL: summary stats over the full event manifest for the overview
-    page — distinct anriss/area/process-source counts, plus a map-centre
-    point (WGS84). One DuckDB aggregate row, not a 61.3M-row materialization
-    — the pmtiles tileset (overview/overview_preprocessing.py) renders
-    individual anrisse now, nothing here needs them as Python objects. The
-    centre point transforms median(x)/median(y) once rather than
-    transforming every anriss and taking median(lon)/median(lat) — a
-    deliberate approximation, fine for a cosmetic initial map view."""
-    n_anriss, n_areas, n_pq, center_lon, center_lat = _catalog_cursor().execute("""
-        SELECT n_anriss, n_areas, n_prozessquellen,
-               ST_X(geom) AS center_lon, ST_Y(geom) AS center_lat
-        FROM (
-            SELECT count(DISTINCT id_anriss)       AS n_anriss,
-                   count(DISTINCT "A")              AS n_areas,
-                   count(DISTINCT id_prozessquelle) AS n_prozessquellen,
-                   ST_Transform(ST_Point(median(x_anriss), median(y_anriss)),
-                                'EPSG:2056', 'EPSG:4326', always_xy := true) AS geom
-            FROM events
-        )
-    """).fetchone()
+    """Summary of the full event manifest for the overview page: distinct
+    anriss/area/prozessquelle counts and a map-centre point (WGS84, the
+    transformed median x/y -- a cosmetic initial view). Precomputed in the
+    catalog stats, no scan."""
+    st = _catalog_stats()
+    center_lon, center_lat = Transformer.from_crs("EPSG:2056", "EPSG:4326", always_xy=True).transform(
+        st["center_x"], st["center_y"])
     return {
-        "anriss_count": n_anriss, "area_count": n_areas, "pq_count": n_pq,
+        "anriss_count": st["n_anriss"], "area_count": st["n_areas"], "pq_count": st["n_prozessquellen"],
         "center_lon": center_lon, "center_lat": center_lat,
     }
-
-
-# km^2 home-tile of an anriss, from its own x/y -- shared by gold_coverage_stats
-# below and _official_home_kacheln (module-level so both stay in lockstep;
-# also exactly monitoring/build_maxi_progress_page.py's floor(x/1000)/
-# floor(y/1000) tile definition, just expressed as one id_kachel int instead
-# of a (te, tn) pair).
-_HOME_KACHEL_SQL = '(floor(x_anriss / 1000)::BIGINT * 10000 + floor(y_anriss / 1000)::BIGINT)'
 
 
 def gold_coverage_stats() -> dict:
@@ -979,30 +841,20 @@ def gold_coverage_stats() -> dict:
     indicator, not a completeness guarantee: an anriss only avoids
     GoldNotReadyError once its whole reachable 5x5-kachel neighborhood is
     finalized (see _event_relevant_kacheln), and a finalized home kachel
-    doesn't imply that. Cheap regardless — a local join between the event
-    catalog (catalog.db) and the finalized-kachel set (gold_manifest.db), no
-    S3 calls. Replaced the old gold_anriss_kacheln index (2026-08-03):
+    doesn't imply that. Cheap: the catalog stats' per-home-kachel counts
+    (additive -- every anriss has exactly one home kachel) and value sets,
+    restricted to the finalized kacheln. Replaced the old gold_anriss_kacheln index (2026-08-03):
     id_kachel is a deterministic function of x/y, so no index was ever
     needed, just this join."""
-    finalized = list(_finalized_kacheln())
-    if not finalized:
+    finalized = _finalized_kacheln()
+    covered = [v for k, v in _catalog_stats()["home_kacheln"].items() if k in finalized]
+    if not covered:
         return {"anriss_count": 0, "area_count": 0, "pq_count": 0, "sim_count": 0}
-
-    con = _catalog_cursor()
-    n_anriss, n_areas, n_pq = con.execute(
-        f"""SELECT count(DISTINCT id_anriss), count(DISTINCT "A"), count(DISTINCT id_prozessquelle)
-            FROM events WHERE {_HOME_KACHEL_SQL} = ANY(?)""",
-        [finalized],
-    ).fetchone()
-    if not n_anriss:
-        return {"anriss_count": 0, "area_count": 0, "pq_count": 0, "sim_count": 0}
-
-    n_rows = con.execute(
-        f"SELECT count(*) FROM event_params WHERE {_HOME_KACHEL_SQL} = ANY(?)", [finalized]
-    ).fetchone()[0]
     return {
-        "anriss_count": n_anriss, "area_count": n_areas, "pq_count": n_pq,
-        "sim_count": n_rows * len(_PHYSICS_GRID),
+        "anriss_count": sum(v["n_anriss"] for v in covered),
+        "area_count": len({a for v in covered for a in v["areas"]}),
+        "pq_count": len({q for v in covered for q in v["prozessquellen"]}),
+        "sim_count": sum(v["n_rows"] for v in covered) * len(_PHYSICS_GRID),
     }
 
 
@@ -1036,10 +888,8 @@ def _expected_gold_kacheln() -> frozenset[int]:
     manifest) is the actual completion universe on both counts. Cached:
     derived purely from the static event manifest, never changes during a
     running process."""
-    con = _catalog_cursor()
-    home = [r[0] for r in con.execute(f"SELECT DISTINCT {_HOME_KACHEL_SQL} FROM events").fetchall()]
     expected = set()
-    for h in home:
+    for h in _catalog_stats()["home_kacheln"]:
         expected.update(kachel_neighbors(h))
     return frozenset(expected)
 
@@ -1076,17 +926,6 @@ def load_kachel_coverage() -> gpd.GeoDataFrame:
 
 
 def count_simulations() -> int:
-    """LOCAL: total simulations the campaign will (eventually) produce —
-    every manifest row (id_anriss x h_type) x the full physics grid. Not
-    gold-derived, so no S3 read: purely arithmetic against the plan.
-
-    catalog.db's event_params has exactly one row per manifest row (no
-    DISTINCT, see get_catalog_con), so COUNT(*) against it is the same
-    number the raw manifest would give -- reads the index instead of
-    re-scanning the 540MB file (2026-09-18: this used to do that scan on
-    every call; this stat backs the Übersicht page, so it ran on every
-    cold-page-load)."""
-    manifest_rows = _catalog_cursor().execute(
-        "SELECT COUNT(*) FROM event_params"
-    ).fetchone()[0]
-    return manifest_rows * len(_PHYSICS_GRID)
+    """Total simulations the campaign produces -- every manifest row
+    (id_anriss x h_type) x the full physics grid, from the catalog stats."""
+    return _catalog_stats()["n_manifest_rows"] * len(_PHYSICS_GRID)

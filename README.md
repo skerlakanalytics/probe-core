@@ -31,7 +31,7 @@ Extracted on 2026-09-18 from `pgr-atlas` (`app/probe_control_center/`, commit
 | `probe_core.resources` | DuckDB memory/thread/spill limits from the container's cgroup, else the host |
 | `probe_core.campaign` | facts about the MAXI data: physics grid, events per batch, manifest key |
 | `probe_core.data_lake.data_lake_schema` | lake layout, column names, constants (reads `data/cfgCom1DFA_template.ini`) |
-| `probe_core.data_lake.data_interface` | read layer: gold, catalog, hull fragments, stats |
+| `probe_core.data_lake.data_interface` | read layer: gold, event catalog (per-anriss lookups + totals, on S3), hull fragments, stats |
 | `probe_core.derivate.maxi_ifk_and_raster`, `maxi_event_export` | IFK and on-demand rasters, event export |
 | `probe_core.derivate.derivate_lake` | read side of the derivate lake (`Data-Lake-Derivate/<metric>/…`, written by the pipeline's `derivate/run_derivate.py`): paths, band-name parsing, S3 discovery, cropping a canton mosaic to a selection |
 
@@ -45,9 +45,15 @@ environment is read when a value is used:
 | `PROBE_S3_ENDPOINT_URL` | `https://f712.gos3.io` | S3 endpoint |
 | `HOSTTECH_BERLIN_OBJECT_STORAGE_ACCESS_KEY` / `_KEY_SECRET` | — | S3 credentials |
 | `PROBE_S3_BUCKET_GOLD` | `maxi` | gold / derivate bucket |
-| `PROBE_LOCAL_STATE_DIR` | `~/probe_explorer/local_state` | local catalog / manifest indexes |
 | `PROBE_DUCKDB_MAX_TEMP_SIZE` | DuckDB's own | cap for DuckDB spill files |
 | `https_proxy`, `http_proxy`, `no_proxy` | — | egress proxy, also applied to DuckDB |
+
+No local state: per-anriss lookups and the catalog totals come from the event
+catalog at the gold bucket's root (`maxi_event_manifest_by_id_anriss.parquet`, sorted by
+`id_anriss`, and `maxi_event_manifest_stats.json`, built by ProBE_control_center's
+`data_lake/build_event_catalog.py`), and the finalized gold kacheln are listed
+from S3 into memory (once, on first use or `refresh_gold_manifest()`). Until
+2026-09-27 both were local DuckDB files under `PROBE_LOCAL_STATE_DIR`.
 
 Loading a `.env` file is the job of the entry point (`load_dotenv()` before the
 first S3 call); the former `utils.py` did it on import.
