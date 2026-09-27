@@ -30,3 +30,5 @@ def test_import_has_no_side_effects(tmp_path):
     assert result.returncode == 0, result.stderr
     assert not (tmp_path / "probe_explorer" / "local_state").exists(), \
         "no local state since 2026-09-27 (catalog and gold manifest come from S3)"
+    assert not (tmp_path / "probe_explorer" / ".cache_maxi").exists(), \
+        "the envelope cache dir must be created on first write, not on import"
