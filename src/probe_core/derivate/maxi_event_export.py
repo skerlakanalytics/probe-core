@@ -13,6 +13,7 @@ data_interface.py's module docstring — pending the enrich phase).
 import io
 import json
 import os
+import uuid
 from pathlib import Path
 
 import geopandas as gpd
@@ -96,9 +97,14 @@ def export_event_envelope_geojson(df: pd.DataFrame, id_anriss: int):
     )
 
     # Atomic: an interrupted write must not leave a truncated file at
-    # cache_path, whose mere existence is trusted above.
+    # cache_path, whose mere existence is trusted above. The temp name is
+    # unique per call, not per process: Streamlit serves every browser
+    # session as a thread of ONE process, and several pods can share the
+    # cache volume. Concurrent writers of the same event produce identical
+    # content, so whichever os.replace comes last simply wins; a reader
+    # always sees either no file or a complete one.
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp_path = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
+    tmp_path = cache_path.with_name(f".{cache_path.name}.{uuid.uuid4().hex}.tmp")
     envelope_gdf_lv95.to_file(str(tmp_path), driver='GeoJSON')
     os.replace(tmp_path, cache_path)
     geojson_data = json.loads(envelope_gdf_lv95.to_crs('EPSG:4326').to_json())
