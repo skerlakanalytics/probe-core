@@ -2,6 +2,7 @@
 gold_manifest.db are gone; lookups read an id_anriss-sorted parquet, totals a
 precomputed JSON. S3 is replaced by a local parquet and fixed stats here."""
 
+import duckdb
 import pandas as pd
 import pytest
 
@@ -27,14 +28,16 @@ def catalog(tmp_path, monkeypatch):
         "sort_key": [11, 12, 101, 102, 205, 206],
     })
     path = tmp_path / "catalog.parquet"
-    rows.to_parquet(path)
+    duckdb.connect().register("rows", rows).execute(f"COPY rows TO '{path}' (FORMAT parquet)")
     monkeypatch.setattr(di, "EVENT_CATALOG_S3_URI", str(path))
     monkeypatch.setattr(di, "_catalog_stats", lambda: STATS)
     di._catalog_con.cache_clear()
+    di._catalog_rows.cache_clear()
     di._catalog_tls.__dict__.clear()
     di._expected_gold_kacheln.cache_clear()
     yield
     di._catalog_con.cache_clear()
+    di._catalog_rows.cache_clear()
     di._catalog_tls.__dict__.clear()
     di._expected_gold_kacheln.cache_clear()
 
@@ -88,3 +91,37 @@ def test_gold_manifest_is_a_fresh_snapshot(monkeypatch):
     monkeypatch.setattr(di, "_s3_gold_connection", lambda: FakeCon([2, 3]))
     assert di.refresh_gold_manifest() == {"new_kacheln": 1, "total_kacheln": 2}
     assert di._finalized_kacheln() == {2, 3}                      # kachel 1 is gone, not kept
+
+
+def test_thread_cursors_carry_the_s3_settings():
+    """SET s3_* is per connection; a cursor that doesn't repeat it reads S3
+    anonymously (403) -- caught against real S3 on 2026-09-27."""
+    import threading
+    di._catalog_con.cache_clear()
+    di._catalog_tls.__dict__.clear()
+    endpoints = []
+
+    def probe():
+        endpoints.append(di._catalog_cursor().execute("SELECT current_setting('s3_endpoint')").fetchone()[0])
+    t = threading.Thread(target=probe)
+    t.start()
+    t.join()
+    base = di._catalog_con().execute("SELECT current_setting('s3_endpoint')").fetchone()[0]
+    assert endpoints == [base] and base
+    di._catalog_con.cache_clear()
+
+
+def test_one_s3_read_per_anriss(catalog, monkeypatch):
+    """Params, existence and both fragment keys share one catalog read."""
+    reads = []
+    cursor = di._catalog_cursor
+
+    def counting():
+        reads.append(1)
+        return cursor()
+    monkeypatch.setattr(di, "_catalog_cursor", counting)
+    di.get_event_params(3)
+    di.id_anriss_exists(3)
+    di._hull_fragment_s3_key(3)
+    di._sim_anriss_s3_key(3)
+    assert len(reads) == 1

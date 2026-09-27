@@ -693,11 +693,7 @@ def get_event_params(id_anriss: int) -> pd.DataFrame:
     Reads the id_anriss-sorted event catalog on S3 rather than the 540MB
     manifest, which is ordered by sort_key (SW->NE batch sweep) and so
     can't prune row groups for a WHERE id_anriss = ?."""
-    rows = _catalog_cursor().execute(
-        f"""SELECT id_anriss, id_prozessquelle, x_anriss, y_anriss, d, "A", h, h_type
-            FROM read_parquet('{EVENT_CATALOG_S3_URI}') WHERE id_anriss = ?""",
-        [int(id_anriss)],
-    ).df()
+    rows = _catalog_rows(int(id_anriss)).drop(columns="sort_key")
     if rows.empty:
         raise ValueError(f"id_anriss {id_anriss} not in the event manifest")
     grid = pd.DataFrame(_PHYSICS_GRID, columns=["mu", "xsi", "tau0"])
@@ -779,22 +775,39 @@ _catalog_tls = threading.local()
 
 
 def _catalog_cursor() -> duckdb.DuckDBPyConnection:
-    return _thread_local_cursor(_catalog_tls, _catalog_con())
+    """This thread's cursor on _catalog_con. DuckDB's SET s3_*/http_proxy are
+    per connection and a cursor is a connection of its own, so every cursor
+    gets the S3 settings again (without them it reads anonymously: 403)."""
+    con = getattr(_catalog_tls, "con", None)
+    if con is None:
+        con = _catalog_con().cursor()
+        configure_s3_for_duckdb(con)
+        _catalog_tls.con = con
+    return con
 
 
-def _catalog_lookup(id_anriss: int, columns: str) -> list[tuple]:
-    """The event catalog's rows for one anriss (one per h variant)."""
+_CATALOG_COLUMNS = ["id_anriss", "id_prozessquelle", "x_anriss", "y_anriss", "d", "A", "h", "h_type", "sort_key"]
+
+
+@lru_cache(maxsize=4096)
+def _catalog_rows(id_anriss: int) -> pd.DataFrame:
+    """The event catalog's rows for one anriss (one per h variant), read once
+    per process: opening an anriss needs its parameters, its existence and the
+    sort_key behind two fragment keys, and each S3 lookup costs ~0.1-0.4 s.
+    The catalog is immutable, so caching can't go stale. Don't mutate the
+    returned frame (callers copy)."""
     return _catalog_cursor().execute(
-        f"SELECT {columns} FROM read_parquet('{EVENT_CATALOG_S3_URI}') WHERE id_anriss = ?",
+        f"""SELECT {', '.join(f'"{c}"' for c in _CATALOG_COLUMNS)}
+            FROM read_parquet('{EVENT_CATALOG_S3_URI}') WHERE id_anriss = ?""",
         [int(id_anriss)],
-    ).fetchall()
+    ).df()
 
 
 def _catalog_sort_key(id_anriss: int) -> int | None:
     """id_anriss -> its manifest sort_key (identical for its h variants:
     both run in the same batch), None if it isn't in the manifest."""
-    rows = _catalog_lookup(id_anriss, "sort_key")
-    return rows[0][0] if rows else None
+    rows = _catalog_rows(int(id_anriss))
+    return int(rows["sort_key"].iloc[0]) if len(rows) else None
 
 
 @lru_cache(maxsize=1)
