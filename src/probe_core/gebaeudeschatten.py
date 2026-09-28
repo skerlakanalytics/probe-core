@@ -12,15 +12,15 @@ affected is exactly one the explanation calls counting.
 
 Rules, per gold row (one simulation of one building at one pixel):
 
-  raw                            counts if Fliesstiefe >= MIN_DEPTH_CM, judged
+  raw                            counts if Fliesstiefe >= the minimum depth, judged
                                  on SIM_SPATIAL's unzeroed depth
   shadowing_building             excludes the row's own building
                                  (own_building_mask = 1); the neighbour ring
                                  (= 2) counts by presence alone, because
                                  SIM_SPATIAL_ZEROED zeroed its depth; other
-                                 rows need Fliesstiefe >= MIN_DEPTH_CM
+                                 rows need Fliesstiefe >= the minimum depth
   shadowing_building_surrounding excludes own building and neighbour ring,
-                                 rows below MIN_DEPTH_CM, and the 8 neighbours
+                                 rows below the minimum depth, and the 8 neighbours
                                  of the building's own = 1 pixels. The last
                                  one only matters for buildings too small to
                                  contain a grid center: their single = 1 pixel
@@ -30,6 +30,9 @@ Rules, per gold row (one simulation of one building at one pixel):
 A pixel is affected when at least one row there counts; rows are judged per
 building, so a pixel excluded for one building can still be affected by
 another. own_building_mask itself is computed in gold (see the gold worker).
+
+The minimum depth is one of MIN_DEPTHS_CM (1 cm: noise filter; 10 cm: where low
+intensity typically starts); every raster and reason column exists per minimum.
 """
 
 import threading
@@ -42,7 +45,7 @@ from probe_core.data_lake.data_lake_schema import (
     DATA_LAKE_DIR_GEBAEUDESCHATTEN_DERIVATE,
     DATA_LAKE_DIR_GEBAEUDESCHATTEN_DERIVATE_AFFECTED_MASK,
     DATA_LAKE_DIR_GEBAEUDESCHATTEN_DERIVATE_BUILDING_MASK,
-    GEBAEUDESCHATTEN_AFFECTED_MASK_MIN_DEPTH_CM,
+    GEBAEUDESCHATTEN_AFFECTED_MASK_MIN_DEPTHS_CM,
     GEBAEUDESCHATTEN_AFFECTED_MASK_VARIANTS,
     GEBAEUDESCHATTEN_GOLD_REACH_VARIANTS_M,
     gebaeudeschatten_gold_sim_anriss_dir,
@@ -54,7 +57,7 @@ from probe_core.s3 import configure_s3_for_duckdb, s3_key_exists
 
 VARIANTS = GEBAEUDESCHATTEN_AFFECTED_MASK_VARIANTS
 REACHES_M = GEBAEUDESCHATTEN_GOLD_REACH_VARIANTS_M
-MIN_DEPTH_CM = GEBAEUDESCHATTEN_AFFECTED_MASK_MIN_DEPTH_CM
+MIN_DEPTHS_CM = GEBAEUDESCHATTEN_AFFECTED_MASK_MIN_DEPTHS_CM
 RESOLUTION_M = 5.0
 # Upper bound on a release polygon's bbox side (full-canton manifest
 # 2026-09-21: max 374 m). A building reaching a pixel has its own pixels
@@ -68,7 +71,7 @@ NEIGHBOR_OFFSETS = ((5, 0), (-5, 0), (0, 5), (0, -5), (5, 5), (5, -5), (-5, 5), 
 # Exclusion reasons returned by exclusion_reason_sql (NULL = the row counts).
 REASON_OWN_BUILDING = "own_building"          # own_building_mask = 1
 REASON_OWN_NEIGHBOR = "own_neighbor"          # own_building_mask = 2
-REASON_BELOW_MIN_DEPTH = "below_min_depth"    # Fliesstiefe < MIN_DEPTH_CM
+REASON_BELOW_MIN_DEPTH = "below_min_depth"    # Fliesstiefe < the minimum depth
 REASON_FALLBACK_NEIGHBOR = "fallback_neighbor"  # next to the building's own = 1 pixel, no = 2 there
 REASONS = (REASON_OWN_BUILDING, REASON_OWN_NEIGHBOR, REASON_BELOW_MIN_DEPTH, REASON_FALLBACK_NEIGHBOR)
 
@@ -83,22 +86,25 @@ BUILDING_MASK_KEY = f"{DATA_LAKE_DIR_GEBAEUDESCHATTEN_DERIVATE_BUILDING_MASK}/ca
 _SIM_KEY_COLS = ("id_start", "A", "h", "mu", "xsi", "tau0")
 
 
-def _check(reach_m: int, variant: str | None = None) -> None:
-    if reach_m not in REACHES_M:
+def _check(reach_m: int | None = None, variant: str | None = None, min_depth_cm: int | None = None) -> None:
+    if reach_m is not None and reach_m not in REACHES_M:
         raise ValueError(f"reach_m={reach_m!r} not in {REACHES_M}")
     if variant is not None and variant not in VARIANTS:
         raise ValueError(f"variant={variant!r} not in {VARIANTS}")
+    if min_depth_cm is not None and min_depth_cm not in MIN_DEPTHS_CM:
+        raise ValueError(f"min_depth_cm={min_depth_cm!r} not in {MIN_DEPTHS_CM}")
 
 
 # ── paths ────────────────────────────────────────────────────────────────────
 
-def affected_mask_filename(reach_m: int, variant: str) -> str:
-    _check(reach_m, variant)
-    return f"canton_affected_mask_{variant}_{reach_m}m.tif"
+def affected_mask_filename(reach_m: int, variant: str, min_depth_cm: int) -> str:
+    _check(reach_m, variant, min_depth_cm)
+    return f"canton_affected_mask_{variant}_{reach_m}m_min{min_depth_cm}cm.tif"
 
 
-def affected_mask_key(reach_m: int, variant: str) -> str:
-    return f"{DATA_LAKE_DIR_GEBAEUDESCHATTEN_DERIVATE_AFFECTED_MASK}/{affected_mask_filename(reach_m, variant)}"
+def affected_mask_key(reach_m: int, variant: str, min_depth_cm: int) -> str:
+    return (f"{DATA_LAKE_DIR_GEBAEUDESCHATTEN_DERIVATE_AFFECTED_MASK}/"
+            f"{affected_mask_filename(reach_m, variant, min_depth_cm)}")
 
 
 def gold_key(reach_m: int, dataset: str) -> str:
@@ -122,22 +128,22 @@ def affected_mask_source_key(reach_m: int, variant: str) -> str:
 
 # ── rules ────────────────────────────────────────────────────────────────────
 
-def exclusion_reason_sql(variant: str, depth: str = "Fliesstiefe", mask: str = "own_building_mask",
-                         in_own1_ring: str = "in_own1_ring") -> str:
-    """SQL CASE expression: NULL if the row counts as affected under `variant`,
-    else one of REASONS. `depth` is Fliesstiefe [cm]; for raw it must be the
+def exclusion_reason_sql(variant: str, min_depth_cm: int, depth: str = "Fliesstiefe",
+                         mask: str = "own_building_mask", in_own1_ring: str = "in_own1_ring") -> str:
+    """SQL CASE expression: NULL if the row counts as affected under `variant`
+    at minimum depth `min_depth_cm` (one of MIN_DEPTHS_CM), else one of REASONS.
+    `depth` is Fliesstiefe [cm]; for raw it must be the
     unzeroed value (SIM_SPATIAL), for the other two either works (they only
     judge depth where own_building_mask = 0, and zeroing leaves those rows
     alone). `in_own1_ring` (surrounding only) is a boolean column from
     own1_ring_sql."""
-    if variant not in VARIANTS:
-        raise ValueError(f"variant={variant!r} not in {VARIANTS}")
-    below = f"WHEN {depth} < {MIN_DEPTH_CM} THEN '{REASON_BELOW_MIN_DEPTH}'"
+    _check(variant=variant, min_depth_cm=min_depth_cm)
+    below = f"WHEN {depth} < {int(min_depth_cm)} THEN '{REASON_BELOW_MIN_DEPTH}'"
     if variant == "raw":
         return f"(CASE {below} END)"
     if variant == "shadowing_building":
         return (f"(CASE WHEN {mask} = 1 THEN '{REASON_OWN_BUILDING}' "
-                f"WHEN {mask} = 0 AND {depth} < {MIN_DEPTH_CM} THEN '{REASON_BELOW_MIN_DEPTH}' END)")
+                f"WHEN {mask} = 0 AND {depth} < {int(min_depth_cm)} THEN '{REASON_BELOW_MIN_DEPTH}' END)")
     return (f"(CASE WHEN {mask} = 1 THEN '{REASON_OWN_BUILDING}' "
             f"WHEN {mask} = 2 THEN '{REASON_OWN_NEIGHBOR}' "
             f"{below} "
@@ -154,12 +160,10 @@ def own1_ring_sql(own1_sql: str) -> str:
             f"FROM ({own1_sql}) o CROSS JOIN (VALUES {offsets}) AS off(dx, dy)")
 
 
-def affected_pixels_sql(variant: str, source: str) -> str:
+def affected_pixels_sql(variant: str, source: str, min_depth_cm: int) -> str:
     """The canton-wide raster query: DISTINCT (x, y) with at least one counting
     row. `source` is the parquet path/URL of affected_mask_source_key's file."""
-    if variant not in VARIANTS:
-        raise ValueError(f"variant={variant!r} not in {VARIANTS}")
-    reason = exclusion_reason_sql(variant)
+    reason = exclusion_reason_sql(variant, min_depth_cm)
     if variant != "shadowing_building_surrounding":
         return f"SELECT DISTINCT x, y FROM read_parquet('{source}') WHERE {reason} IS NULL"
     return f"""
@@ -175,8 +179,15 @@ def affected_pixels_sql(variant: str, source: str) -> str:
     """
 
 
+def reason_column(variant: str, min_depth_cm: int) -> str:
+    """Column of building_rows/pixel_rows holding the reason for (variant, min depth)."""
+    _check(variant=variant, min_depth_cm=min_depth_cm)
+    return f"reason_{variant}_min{min_depth_cm}cm"
+
+
 def _reason_columns_sql() -> str:
-    return ", ".join(f"{exclusion_reason_sql(v)} AS reason_{v}" for v in VARIANTS)
+    return ", ".join(f"{exclusion_reason_sql(v, d)} AS {reason_column(v, d)}"
+                     for v in VARIANTS for d in MIN_DEPTHS_CM)
 
 
 # ── read layer (app) ─────────────────────────────────────────────────────────
@@ -229,8 +240,8 @@ def is_available(bucket: str = S3_BUCKET_GOLD) -> bool:
 
 def building_rows(id_start: int, reach_m: int, bucket: str = S3_BUCKET_GOLD) -> pd.DataFrame:
     """Every gold row of one building (all its simulations), unzeroed values
-    plus own_building_mask, in_own1_ring and reason_<variant> for each variant
-    (NULL = counts). Empty if the building has no rows at this reach."""
+    plus own_building_mask, in_own1_ring and one reason column per (variant,
+    minimum depth), see reason_column (NULL = counts). Empty if the building has no rows at this reach."""
     _check(reach_m)
     con = _cursor()
     try:
@@ -267,7 +278,7 @@ def building_rows(id_start: int, reach_m: int, bucket: str = S3_BUCKET_GOLD) -> 
 def pixel_rows(x: float, y: float, reach_m: int, bucket: str = S3_BUCKET_GOLD) -> pd.DataFrame:
     """Every gold row at one pixel center (every simulation of every building
     that reaches it), unzeroed values plus own_building_mask, in_own1_ring and
-    reason_<variant> for each variant (NULL = counts)."""
+    one reason column per (variant, minimum depth), see reason_column (NULL = counts)."""
     _check(reach_m)
     zeroed = _url(bucket, gold_key(reach_m, "SIM_SPATIAL_ZEROED"))
     spatial = _url(bucket, gold_key(reach_m, "SIM_SPATIAL"))

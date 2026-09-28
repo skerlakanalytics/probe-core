@@ -213,7 +213,10 @@ GEBAEUDESCHATTEN_AFFECTED_MASK_VARIANTS = ("raw", "shadowing_building", "shadowi
 # Measured against the full campaign's real depth distribution before
 # picking this value: 11.7% of previously-"affected" (id_start, x, y) rows
 # fall under 1cm (430,211 of 3,674,797 silver rows).
-GEBAEUDESCHATTEN_AFFECTED_MASK_MIN_DEPTH_CM = 1
+# 2026-09-28 (Bojan): a second minimum of 10 cm, where low intensity for Hangmuren
+# typically starts -- a severity threshold next to the 1 cm noise filter. Each minimum
+# gets its own set of rasters (filename suffix _min<N>cm); add values, don't replace.
+GEBAEUDESCHATTEN_AFFECTED_MASK_MIN_DEPTHS_CM = (1, 10)
 
 # Deliverable to geo7 needs the reach capped much tighter than MAXI's runouts
 # (buildings, not torrent Anrisse) at two different distances they want to
