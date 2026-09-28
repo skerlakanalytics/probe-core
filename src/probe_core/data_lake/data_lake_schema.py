@@ -224,8 +224,8 @@ GEBAEUDESCHATTEN_AFFECTED_MASK_MIN_DEPTH_CM = 1
 # equals the simulation domain cap itself, so it acts as "no filter"). Add to
 # this tuple, don't replace, if a further variant is ever requested — every
 # consumer keyed off it (gold compact, the affected-mask derivate) iterates
-# it rather than hardcoding specific values.
-GEBAEUDESCHATTEN_GOLD_REACH_VARIANTS_M = (800, 100, 50)
+# it rather than hardcoding specific values. 25 m added 2026-09-28 (Bojan).
+GEBAEUDESCHATTEN_GOLD_REACH_VARIANTS_M = (800, 100, 50, 25)
 
 
 def gebaeudeschatten_gold_reach_dir(reach_m: int) -> str:
