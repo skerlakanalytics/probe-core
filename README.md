@@ -33,7 +33,7 @@ Extracted on 2026-09-18 from `pgr-atlas` (`app/probe_control_center/`, commit
 | `probe_core.data_lake.data_lake_schema` | lake layout, column names, constants (reads `data/cfgCom1DFA_template.ini`) |
 | `probe_core.data_lake.data_interface` | read layer: gold, event catalog (per-anriss lookups + totals, on S3), hull fragments, stats |
 | `probe_core.derivate.maxi_ifk_and_raster`, `maxi_event_export` | IFK and on-demand rasters, event export |
-| `probe_core.gebaeudeschatten` | Gebäudeschatten campaign (building footprints as release areas): the affected-mask rules (one definition, used by the pipeline's rasters and the app's explanations), S3 layout, and the read layer of the app's Gebäudeschatten view (one building's rows, one pixel's rows, footprint pixels, building outlines) |
+| `probe_core.gebaeudeschatten` | Gebäudeschatten campaign (building footprints as release areas): the affected-mask rules per minimum depth (1 and 10 cm since 0.8.0; one definition, used by the pipeline's rasters and the app's explanations), S3 layout, and the read layer of the app's Gebäudeschatten view (one building's rows, one pixel's rows, footprint pixels, building outlines) |
 | `probe_core.derivate.derivate_lake` | read side of the derivate lake (`Data-Lake-Derivate/<metric>/…`, written by the pipeline's `derivate/run_derivate.py`): paths, band-name parsing, S3 discovery, cropping a canton mosaic to a selection |
 
 ## Configuration
