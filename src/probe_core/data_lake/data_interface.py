@@ -90,7 +90,10 @@ _PHYSICS_GRID = list(itertools.product(_maxi_params["mu"], _maxi_params["xsi"], 
 # needed by _hull_fragment_s3_key below to compute an id_anriss's batch/range
 # straight from arithmetic, matching the campaign's actual batching.
 
-S3_BUCKET_GOLD = os.getenv("PROBE_S3_BUCKET_GOLD", "maxi")
+# The one bucket a deployment reads everything from (gold, catalog, hulls,
+# derivates, Gebäudeschatten, tilesets): maxi = full canton, a test bucket =
+# a region-scoped copy. PROBE_S3_BUCKET_GOLD before 0.7.0.
+S3_BUCKET_GOLD = os.getenv("PROBE_S3_BUCKET", "maxi")
 # Upfront simulation plan (not gold -- it exists before any simulation runs):
 # the 540 MB, 122.6M-row manifest at the gold bucket's root (a copy of the
 # fleet's input/ original; re-copy it to both gold buckets if it is ever
