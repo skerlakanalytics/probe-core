@@ -639,11 +639,24 @@ def _bind_gold_tile(con, id_kachel, selection) -> bool:
     return True
 
 
+def _raw_threshold(variable: str, threshold: float) -> float:
+    """A display-unit threshold (m, m/s, kN/m²) in gold's stored unit (cm,
+    cm/s, kPa), for comparing against the integer gold columns.
+
+    Rounded to 6 decimals: the plain division carries floating-point noise
+    (0.07 / 0.01 == 7.000000000000001), and `Fliesstiefe >= 7.000000000000001`
+    silently drops the pixels at exactly 7 cm -- 18 of the 600 thresholds
+    0.01 .. 6.00 were affected. 6 decimals is far below gold's resolution, so
+    a threshold between two stored values (0.075 m -> 7.5 cm) still means
+    what it says."""
+    return round(threshold / _TO_DISPLAY[variable], 6)
+
+
 def _run_mode_a(con, variable, threshold, selection, out_dir, kacheln, progress_callback=None,
                 p_h_mean=None, p_h_max=None, extra_tags=None):
     xmin, ymin, xmax, ymax = selection_bounds(selection)
     col = _GOLD_COL[variable]
-    raw_threshold = threshold / _TO_DISPLAY[variable]
+    raw_threshold = _raw_threshold(variable, threshold)
     _has_overrides = p_h_mean is not None or p_h_max is not None
     print(f"\n[{datetime.now():%H:%M:%S}] [Mode A] {variable} >= {threshold} "
           f"over {len(kacheln)} kacheln (MAXI default scenario)")
