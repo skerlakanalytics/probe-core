@@ -32,7 +32,7 @@ Extracted on 2026-09-18 from `pgr-atlas` (`app/probe_control_center/`, commit
 | `probe_core.campaign` | facts about the MAXI data: physics grid, events per batch, manifest key |
 | `probe_core.data_lake.data_lake_schema` | lake layout, column names, constants (reads `data/cfgCom1DFA_template.ini`) |
 | `probe_core.data_lake.data_interface` | read layer: gold, event catalog (per-anriss lookups + totals, on S3), hull fragments, stats |
-| `probe_core.derivate.maxi_ifk_and_raster`, `maxi_event_export` | IFK and on-demand rasters, event export |
+| `probe_core.derivate.maxi_ifk_and_raster`, `maxi_event_export` | IFK and on-demand rasters, event export. Since 0.9.0 a raster is built in two steps: `build_exceedance_curves` (per pixel and variable, the summed event rate at or above each intensity; the slow gold read) and `raster_from_curves` (seconds, any threshold or return period); a caller can keep the curves under `curves_cache_key`. Each job spills into a folder of its own under `/tmp/duckdb_raster_temp_maxi`, and anything there older than 7 days is swept |
 | `probe_core.gebaeudeschatten` | Gebäudeschatten campaign (building footprints as release areas): the affected-mask rules per minimum depth (1 and 10 cm since 0.8.0; one definition, used by the pipeline's rasters and the app's explanations), S3 layout, and the read layer of the app's Gebäudeschatten view (one building's rows, one pixel's rows, footprint pixels, building outlines) |
 | `probe_core.derivate.derivate_lake` | read side of the derivate lake (`Data-Lake-Derivate/<metric>/…`, written by the pipeline's `derivate/run_derivate.py`): paths, band-name parsing, S3 discovery, cropping a canton mosaic to a selection |
 
@@ -48,6 +48,7 @@ environment is read when a value is used:
 | `PROBE_S3_BUCKET` | `maxi` | the one bucket everything is read from (gold, catalog, derivates, tilesets); `PROBE_S3_BUCKET_GOLD` before 0.7.0 |
 | `PROBE_CACHE_DIR` | `~/probe_explorer/.cache_maxi` | per-event envelope GeoJSON cache (created on first write) |
 | `PROBE_DUCKDB_MAX_TEMP_SIZE` | DuckDB's own | cap for DuckDB spill files |
+| `PROBE_RASTER_MAX_ROWS` | `900000000` | largest on-demand raster, in gold rows read (estimated from the gold file sizes, ~15 min); since 0.9.0 |
 | `https_proxy`, `http_proxy`, `no_proxy` | — | egress proxy, also applied to DuckDB |
 
 No local state: per-anriss lookups and the catalog totals come from the event
