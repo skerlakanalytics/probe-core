@@ -34,14 +34,18 @@ GoldCompactWorker.compact_kachel — its kachel_lookup reduction is exactly
 why the original full-lookup join OOM'd and got fixed this way).
 """
 
+import hashlib
+import json
 import os
+import shutil
+import time
 import uuid
 from datetime import datetime
+from functools import lru_cache
 
 import duckdb
 import numpy as np
 import pandas as pd
-import psutil
 import rasterio
 from rasterio.crs import CRS
 from rasterio.transform import from_origin
@@ -52,6 +56,7 @@ from rasterio.transform import from_origin
 from probe_core.data_lake.data_lake_schema import (  # noqa: F401 (GOLD_MAX_REACH_M is re-exported)
     GOLD_MAX_REACH_M, GOLD_P_H_MEAN, GOLD_P_H_MAX,
     DATA_LAKE_PROBABILITIES_RATES_LOOKUP, DATA_LAKE_PROBABILITIES_RATES_ABLAUF,
+    DATA_LAKE_DIR_GOLD_SIM_SPATIAL,
 )
 from probe_core.data_lake.data_interface import (
     GOLD_S3_ROOT, S3_BUCKET_GOLD, _s3_gold_connection,
@@ -60,7 +65,7 @@ from probe_core.resources import (
     container_cpu_limit, container_memory_limit_bytes,
     duckdb_max_temp_directory_size, safe_duckdb_memory_limit,
 )
-from probe_core.s3 import configure_s3_for_duckdb
+from probe_core.s3 import configure_s3_for_duckdb, get_s3_client
 
 # p_Ablauf (geo7 table) -- S3 mirror of the git-tracked input/ file, read the
 # same way as the probability lookup (no local-file dependency; every caller
@@ -652,143 +657,184 @@ def _raw_threshold(variable: str, threshold: float) -> float:
     return round(threshold / _TO_DISPLAY[variable], 6)
 
 
-def _run_mode_a(con, variable, threshold, selection, out_dir, kacheln, progress_callback=None,
-                p_h_mean=None, p_h_max=None, extra_tags=None):
+def _curves_insert_sql() -> str:
+    """Appends the current kachel's exceedance curves (from `base`, built and
+    checked by build_exceedance_curves) to `curves`: per variable, pixel and
+    stored intensity i, p = the summed lambda_ereignis of every event at that
+    pixel with intensity >= i (gold's integer unit). Mode A is 1 / p at the
+    smallest i >= the threshold, Mode B the largest i whose p reaches
+    1 / return period -- so one curve answers every threshold and return
+    period of all three variables."""
+    branches = [f"""
+        SELECT '{var}' AS variable, x, y, i,
+               SUM(s) OVER (PARTITION BY x, y ORDER BY i DESC
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS p
+        FROM (SELECT x, y, "{_GOLD_COL[var]}" AS i, SUM(lambda_ereignis) AS s
+              FROM base GROUP BY x, y, "{_GOLD_COL[var]}")""" for var in INTENSITY_VARS]
+    return "INSERT INTO curves" + "\n        UNION ALL".join(branches)
+
+
+def _job_connection(job_dir: str) -> duckdb.DuckDBPyConnection:
+    """A DuckDB database of its own in job_dir, spilling there.
+
+    One folder per job: DuckDB names spill files by block size only
+    (duckdb_temp_storage_S160K-0.tmp), so two jobs sharing one temp_directory
+    -- two sessions of the same app pod -- overwrite and delete each other's:
+    "IO Error: Could not read enough bytes from file .../duckdb_temp_storage_
+    S160K-0.tmp" (2026-09-29)."""
+    config = {
+        'preserve_insertion_order': False,
+        'temp_directory': job_dir,
+        'memory_limit': safe_duckdb_memory_limit(),
+        # threads from the cgroup quota, not the node's CPU count: 8 threads
+        # against a 4-CPU pod limit buys no speed and doubles the number of
+        # concurrent spill files.
+        'threads': container_cpu_limit(),
+    }
+    # Bound the on-disk spill when the deployment says how much room there is.
+    # DuckDB's default is "90% of available disk space", measured against the
+    # NODE's filesystem -- it cannot see an emptyDir sizeLimit, so it spills
+    # until the kubelet evicts the pod. Measured 2026-09-16 on the Hosttech
+    # rehearsal: >21.6 GB for one bbox, pod evicted twice, job never finished
+    # (NOTES.md, rehearsal finding 3). With the cap, an oversized job fails
+    # with a clear DuckDB error instead of the pod being killed under it.
+    max_temp = duckdb_max_temp_directory_size()
+    if max_temp:
+        config['max_temp_directory_size'] = max_temp
+    # On-disk DB so DuckDB can spill (':memory:' ignores temp_directory).
+    return duckdb.connect(os.path.join(job_dir, 'work.db'), config=config)
+
+
+class _JobDir:
+    """A private folder under RASTER_TEMP_DIR for one job's database and
+    spill, deleted on exit. Entering also sweeps what killed jobs left."""
+
+    def __enter__(self) -> str:
+        # MAXI-specific name (not MIDI's '/tmp/duckdb_raster_temp'): MIDI runs
+        # as root and creates that dir first with 0755 perms, which locks
+        # bojan's MAXI process out of it entirely.
+        os.makedirs(RASTER_TEMP_DIR, exist_ok=True)
+        sweep_raster_temp(RASTER_TEMP_DIR)
+        self.path = os.path.join(RASTER_TEMP_DIR, f'raster_work_{os.getpid()}_{uuid.uuid4().hex}')
+        os.makedirs(self.path)
+        return self.path
+
+    def __exit__(self, *exc) -> None:
+        shutil.rmtree(self.path, ignore_errors=True)
+
+
+def build_exceedance_curves(selection, out_path: str, progress_callback=None, *,
+                            p_h_mean: float | None = None, p_h_max: float | None = None,
+                            ablauf_override: pd.DataFrame | None = None) -> None:
+    """Reads the selection's gold rows kachel by kachel and writes their
+    exceedance curves (see _curves_insert_sql) to the parquet out_path, which
+    raster_from_curves turns into rasters. Written to a temp name and moved
+    into place, so an existing out_path is always complete.
+
+    Raises RasterBboxTooLargeError before any data is read if the selection
+    is too large (check_raster_size). Expert-mode arguments as for
+    build_raster_for_bbox; they change the curves, so a caller that keeps
+    curves must key them by these too (curves_cache_key)."""
+    selection = normalize_selection(selection)
+    kacheln = kacheln_for_bbox(*selection_bounds(selection))
+    check_raster_size(selection)
+    has_overrides = p_h_mean is not None or p_h_max is not None
+    print(f"\n[{datetime.now():%H:%M:%S}] Exceedance curves over {len(kacheln)} kacheln")
+    tmp_path = f"{out_path}.{uuid.uuid4().hex}.tmp"
+    with _JobDir() as job_dir:
+        con = _job_connection(job_dir)
+        try:
+            con.execute("INSTALL httpfs; LOAD httpfs;")
+            configure_s3_for_duckdb(con)
+            if selection['type'] == 'polygon':
+                # Only for an actual polygon clip (ST_Contains, _bind_gold_tile).
+                con.execute("INSTALL spatial; LOAD spatial;")
+            _register_ablauf(con, ablauf_override)
+            con.execute("CREATE TABLE curves (variable VARCHAR, x DOUBLE, y DOUBLE, i INTEGER, p DOUBLE)")
+            insert_sql = _curves_insert_sql()
+            for n, id_kachel in enumerate(kacheln):
+                if progress_callback:
+                    progress_callback(n, len(kacheln), f"Kachel {n + 1}/{len(kacheln)}")
+                if not _bind_gold_tile(con, id_kachel, selection):
+                    continue
+                # Materialised once: lambda_ereignis feeds three curves and the
+                # validity check below.
+                con.execute(f"""
+                    CREATE OR REPLACE TEMP TABLE base AS
+                    SELECT dg.x, dg.y, dg."Fliesstiefe", dg."Fliessgeschwindigkeit", dg."Druck",
+                           pl.lambda_Hangmuren, {_lambda_ereignis_sql(p_h_mean, p_h_max)} AS lambda_ereignis
+                    FROM gold_tile dg
+                    JOIN probability_lookup pl USING (id_anriss)
+                    JOIN ablauf ab ON dg.mu = ab.mu AND dg.xsi = ab.xsi AND dg.tau0 = ab.tau0
+                """)
+                _assert_valid_lambda_ereignis(con, "SELECT lambda_ereignis, lambda_Hangmuren FROM base",
+                                              f"kachel {id_kachel}", allow_zero=has_overrides)
+                con.execute(insert_sql)
+            if progress_callback and kacheln:
+                progress_callback(len(kacheln), len(kacheln), "Schreibe Kurven…")
+            # Sorted by variable: raster_from_curves reads one variable at a
+            # time and skips the other row groups.
+            con.execute(f"COPY (SELECT * FROM curves ORDER BY variable) TO '{tmp_path}' "
+                        f"(FORMAT parquet, COMPRESSION zstd)")
+            os.replace(tmp_path, out_path)
+        finally:
+            con.close()
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+
+def raster_from_curves(curves_path: str, selection, mode: str, *, variable: str = 'depth',
+                       threshold: float = 1.0, return_period: float = 300, out_dir: str,
+                       extra_tags: dict | None = None) -> list[str]:
+    """The rasters of one request from the curves build_exceedance_curves
+    wrote for this selection: Mode A one GeoTIFF (return period at
+    `threshold` of `variable`), Mode B one per variable (intensity at
+    `return_period`); a raster without any pixel is left out. File names and
+    tags as build_raster_for_bbox documents them."""
+    selection = normalize_selection(selection)
     xmin, ymin, xmax, ymax = selection_bounds(selection)
-    col = _GOLD_COL[variable]
-    raw_threshold = _raw_threshold(variable, threshold)
-    _has_overrides = p_h_mean is not None or p_h_max is not None
-    print(f"\n[{datetime.now():%H:%M:%S}] [Mode A] {variable} >= {threshold} "
-          f"over {len(kacheln)} kacheln (MAXI default scenario)")
-
-    chunks = []
-    for i, id_kachel in enumerate(kacheln):
-        if progress_callback:
-            progress_callback(i, len(kacheln), f"Kachel {i+1}/{len(kacheln)}")
-        if not _bind_gold_tile(con, id_kachel, selection):
-            continue
-        # Materialised once so lambda_ereignis isn't recomputed separately in the
-        # SELECT and the WHERE (it was, before this), and so the validity
-        # check below has a table to point at.
-        con.execute(f"""
-            CREATE OR REPLACE TEMP TABLE mode_a_base AS
-            SELECT dg.x, dg.y, dg."{col}" AS raw_intensity, pl.lambda_Hangmuren,
-                   {_lambda_ereignis_sql(p_h_mean, p_h_max)} AS lambda_ereignis
-            FROM gold_tile dg
-            JOIN probability_lookup pl USING (id_anriss)
-            JOIN ablauf ab ON dg.mu = ab.mu AND dg.xsi = ab.xsi AND dg.tau0 = ab.tau0
-        """)
-        _assert_valid_lambda_ereignis(con, "SELECT lambda_ereignis, lambda_Hangmuren FROM mode_a_base", f"kachel {id_kachel} (Mode A)",
-                                 allow_zero=_has_overrides)
-        df = con.execute(f"""
-            SELECT x, y, 1.0 / SUM(lambda_ereignis) AS return_period
-            FROM mode_a_base
-            WHERE raw_intensity >= {raw_threshold}
-            GROUP BY x, y
-        """).df()
-        if not df.empty:
-            chunks.append(df)
-    if progress_callback and kacheln:
-        progress_callback(len(kacheln), len(kacheln), "Schreibe GeoTIFF…")
-    if not chunks:
-        print("  No pixels exceed threshold — skipping.")
-        return None
-
-    df = pd.concat(chunks, ignore_index=True)
     bbox_slug = f"{int(xmin)}_{int(ymin)}_{int(xmax)}_{int(ymax)}"
-    out_path = os.path.join(
-        out_dir, f'{variable}_at_{threshold}{INTENSITY_SUFFIX[variable]}_{bbox_slug}.tif')
-    _write_single_band(df, 'return_period', out_path, {
-        'mode': 'A', 'variable': variable,
-        'threshold': str(threshold), 'threshold_units': INTENSITY_UNITS[variable],
-        'value_units': 'years (return period)',
-        **_selection_tags(selection, xmin, ymin, xmax, ymax),
-        **(extra_tags or {}),
-    })
-    return out_path
-
-
-def _mode_b_all_vars_sql(p_thresh: float) -> str:
-    """Single pass over mode_b_base (built + validity-checked by
-    _run_mode_b, one real temp table per kachel -- so, unlike a CTE, scanning
-    it from all three branches below doesn't repeat the join that built it):
-    max intensity with p_exceedance >= p_thresh per pixel for all three
-    variables, converted to display units."""
-    branches = []
-    for var in INTENSITY_VARS:
-        col, f = _GOLD_COL[var], _TO_DISPLAY[var]
-        branches.append(f"""
-    {var}_agg AS (SELECT x, y, "{col}" AS i, SUM(lambda_ereignis) AS s
-                  FROM mode_b_base GROUP BY x, y, "{col}"),
-    {var}_exc AS (SELECT x, y, i,
-                         SUM(s) OVER (PARTITION BY x, y ORDER BY i DESC
-                                      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS p
-                  FROM {var}_agg),
-    {var}_res AS (SELECT x, y, MAX(CASE WHEN p >= {p_thresh!r} THEN i END) * {f} AS {var}
-                  FROM {var}_exc GROUP BY x, y
-                  HAVING MAX(CASE WHEN p >= {p_thresh!r} THEN i END) IS NOT NULL)""")
-    return f"""
-    WITH
-    {','.join(branches)}
-    SELECT COALESCE(depth_res.x, velocity_res.x, pressure_res.x) AS x,
-           COALESCE(depth_res.y, velocity_res.y, pressure_res.y) AS y,
-           depth_res.depth, velocity_res.velocity, pressure_res.pressure
-    FROM depth_res
-    FULL JOIN velocity_res USING (x, y)
-    FULL JOIN pressure_res USING (x, y)
-    """
-
-
-def _run_mode_b(con, return_period, selection, out_dir, kacheln, progress_callback=None,
-                p_h_mean=None, p_h_max=None, extra_tags=None):
-    xmin, ymin, xmax, ymax = selection_bounds(selection)
-    p_thresh = 1.0 / return_period
-    rp_str = str(int(return_period)) if float(return_period) == int(return_period) else str(return_period)
-    _has_overrides = p_h_mean is not None or p_h_max is not None
-    print(f"\n[{datetime.now():%H:%M:%S}] [Mode B] T={return_period} yr "
-          f"(p ≥ {p_thresh:.2e}, MAXI default scenario) over {len(kacheln)} kacheln")
-
-    sql = _mode_b_all_vars_sql(p_thresh)
-    chunks = {v: [] for v in INTENSITY_VARS}
-    for i, id_kachel in enumerate(kacheln):
-        if progress_callback:
-            progress_callback(i, len(kacheln), f"Kachel {i+1}/{len(kacheln)}")
-        if not _bind_gold_tile(con, id_kachel, selection):
-            continue
-        con.execute(f"""
-            CREATE OR REPLACE TEMP TABLE mode_b_base AS
-            SELECT dg.x, dg.y, dg."Fliesstiefe", dg."Fliessgeschwindigkeit", dg."Druck", pl.lambda_Hangmuren,
-                   {_lambda_ereignis_sql(p_h_mean, p_h_max)} AS lambda_ereignis
-            FROM gold_tile dg
-            JOIN probability_lookup pl USING (id_anriss)
-            JOIN ablauf ab ON dg.mu = ab.mu AND dg.xsi = ab.xsi AND dg.tau0 = ab.tau0
-        """)
-        _assert_valid_lambda_ereignis(con, "SELECT lambda_ereignis, lambda_Hangmuren FROM mode_b_base", f"kachel {id_kachel} (Mode B)",
-                                 allow_zero=_has_overrides)
-        df_all = con.execute(sql).df()
-        for var in INTENSITY_VARS:
-            df = df_all[['x', 'y', var]].dropna(subset=[var]).rename(columns={var: 'intensity'})
-            if not df.empty:
-                chunks[var].append(df)
-    if progress_callback and kacheln:
-        progress_callback(len(kacheln), len(kacheln), "Schreibe GeoTIFFs…")
-
-    bbox_slug = f"{int(xmin)}_{int(ymin)}_{int(xmax)}_{int(ymax)}"
-    out_paths = []
-    for var in INTENSITY_VARS:
-        if not chunks[var]:
-            print(f"  No pixels reach T={return_period} yr for {var} — skipping.")
-            continue
-        df = pd.concat(chunks[var], ignore_index=True)
-        out_path = os.path.join(out_dir, f'{var}_rp{rp_str}_{bbox_slug}.tif')
-        _write_single_band(df, 'intensity', out_path, {
-            'mode': 'B', 'variable': var, 'value_units': INTENSITY_UNITS[var],
-            'return_period': rp_str, 'exceedance_probability': f'{p_thresh:.2e}',
-            **_selection_tags(selection, xmin, ymin, xmax, ymax),
-            **(extra_tags or {}),
-        })
-        out_paths.append(out_path)
-    return out_paths
+    tags = {**_selection_tags(selection, xmin, ymin, xmax, ymax), **(extra_tags or {})}
+    curves = f"read_parquet('{curves_path}')"
+    with _JobDir() as job_dir:
+        con = _job_connection(job_dir)
+        try:
+            if mode == 'a':
+                df = con.execute(f"""
+                    SELECT x, y, 1.0 / MAX(p) AS return_period FROM {curves}
+                    WHERE variable = ? AND i >= ? GROUP BY x, y
+                """, [variable, _raw_threshold(variable, threshold)]).df()
+                if df.empty:
+                    print("  No pixels exceed threshold — skipping.")
+                    return []
+                out_path = os.path.join(
+                    out_dir, f'{variable}_at_{threshold}{INTENSITY_SUFFIX[variable]}_{bbox_slug}.tif')
+                _write_single_band(df, 'return_period', out_path, {
+                    'mode': 'A', 'variable': variable,
+                    'threshold': str(threshold), 'threshold_units': INTENSITY_UNITS[variable],
+                    'value_units': 'years (return period)', **tags,
+                })
+                return [out_path]
+            p_thresh = 1.0 / return_period
+            rp_str = str(int(return_period)) if float(return_period) == int(return_period) else str(return_period)
+            out_paths = []
+            for var in INTENSITY_VARS:
+                df = con.execute(f"""
+                    SELECT x, y, MAX(i) * {_TO_DISPLAY[var]!r} AS intensity FROM {curves}
+                    WHERE variable = ? AND p >= ? GROUP BY x, y
+                """, [var, p_thresh]).df()
+                if df.empty:
+                    print(f"  No pixels reach T={return_period} yr for {var} — skipping.")
+                    continue
+                out_path = os.path.join(out_dir, f'{var}_rp{rp_str}_{bbox_slug}.tif')
+                _write_single_band(df, 'intensity', out_path, {
+                    'mode': 'B', 'variable': var, 'value_units': INTENSITY_UNITS[var],
+                    'return_period': rp_str, 'exceedance_probability': f'{p_thresh:.2e}', **tags,
+                })
+                out_paths.append(out_path)
+            return out_paths
+        finally:
+            con.close()
 
 
 # _run_mode_a/_run_mode_b pull each kachel's matching rows out of DuckDB via
@@ -825,8 +871,100 @@ def max_raster_kacheln() -> int:
 
 
 class RasterBboxTooLargeError(ValueError):
-    """Raised by build_raster_for_bbox before any work starts -- see
-    MAX_RASTER_KACHELN's docstring for why this guard exists at all."""
+    """Raised by build_raster_for_bbox before any work starts, see
+    check_raster_size."""
+
+
+# Gold's bytes per row, from the parquet footers of 16 kacheln of
+# adelboden-test (2026-09-29): 3.0-3.9, 3.75 typical. A kachel's file size
+# thus gives its row count without reading it -- and the rows read, not the
+# kacheln touched, are what a raster costs: kacheln range from 0 to ~510 M rows.
+_GOLD_BYTES_PER_ROW = 3.75
+# Curve-build throughput (gold read from S3 + curves), measured 2026-09-29 on
+# the WSL dev box (16 threads, 3.4 GB DuckDB memory) over 183 M rows of one
+# dense kachel. A 4-CPU pod is slower; RASTER_MAX_ROWS_DEFAULT leaves room.
+_RASTER_ROWS_PER_SECOND = 1.0e6
+# Largest build allowed: ~15 min at the rate above -- one dense kachel is
+# ~270-510 M rows. Beyond this a job blocks the app's single raster slot for
+# too long (and spills tens of GB). PROBE_RASTER_MAX_ROWS overrides it.
+RASTER_MAX_ROWS_DEFAULT = 900_000_000
+
+
+def raster_max_rows() -> int:
+    return int(os.getenv('PROBE_RASTER_MAX_ROWS') or RASTER_MAX_ROWS_DEFAULT)
+
+
+@lru_cache(maxsize=1)
+def gold_kachel_bytes() -> dict[int, int]:
+    """File size of every gold kachel, from one S3 listing (no data read).
+    Cached for the process: gold is immutable."""
+    sizes = {}
+    pages = get_s3_client().get_paginator('list_objects_v2').paginate(
+        Bucket=S3_BUCKET_GOLD, Prefix=f"{DATA_LAKE_DIR_GOLD_SIM_SPATIAL}/id_kachel=")
+    for page in pages:
+        for obj in page.get('Contents', []):
+            if obj['Key'].endswith('/data.parquet'):
+                sizes[int(obj['Key'].split('id_kachel=')[1].split('/')[0])] = obj['Size']
+    return sizes
+
+
+def estimate_raster_rows(selection) -> int:
+    """Gold rows a build over the selection's bounding rectangle reads: each
+    kachel's rows (file size / _GOLD_BYTES_PER_ROW) times the share of the
+    kachel the rectangle covers, as if rows were spread evenly over it.
+    Measured: a 0.8 x 0.8 km box (64 % of its kachel) read 68 % of the rows."""
+    xmin, ymin, xmax, ymax = selection_bounds(normalize_selection(selection))
+    sizes = gold_kachel_bytes()
+    rows = 0.0
+    for id_kachel in kacheln_for_bbox(xmin, ymin, xmax, ymax):
+        e, n = divmod(id_kachel, 10000)
+        share = (max(0.0, min(xmax, (e + 1) * 1000) - max(xmin, e * 1000))
+                 * max(0.0, min(ymax, (n + 1) * 1000) - max(ymin, n * 1000)) / 1e6)
+        rows += sizes.get(id_kachel, 0) / _GOLD_BYTES_PER_ROW * share
+    return int(rows)
+
+
+def estimate_raster_seconds(selection) -> float:
+    """Rough wall-clock time of building the selection's curves, from
+    estimate_raster_rows and _RASTER_ROWS_PER_SECOND."""
+    return estimate_raster_rows(selection) / _RASTER_ROWS_PER_SECOND
+
+
+def check_raster_size(selection) -> None:
+    """Raises RasterBboxTooLargeError if the selection spans more kacheln
+    than this host can hold (max_raster_kacheln) or more gold rows than
+    raster_max_rows(). Both use the bounding rectangle: gold is fetched by
+    rectangle, so a thin polygon costs what its rectangle costs."""
+    xmin, ymin, xmax, ymax = selection_bounds(normalize_selection(selection))
+    n_kacheln = len(kacheln_for_bbox(xmin, ymin, xmax, ymax))
+    if n_kacheln > max_raster_kacheln():
+        raise RasterBboxTooLargeError(
+            f"Gebiet umfasst {n_kacheln} Kacheln (~{n_kacheln} km²) — mehr als das für dieses "
+            f"System sichere Maximum von {max_raster_kacheln()}. Bitte ein kleineres Gebiet wählen.")
+    rows, max_rows = estimate_raster_rows(selection), raster_max_rows()
+    if rows > max_rows:
+        raise RasterBboxTooLargeError(
+            f"Gebiet enthält geschätzt {rows / 1e6:,.0f} Mio. Simulationspixel — mehr als das Maximum "
+            f"von {max_rows / 1e6:,.0f} Mio. Bitte ein kleineres Gebiet wählen.".replace(",", "'"))
+
+
+def curves_cache_key(selection, p_h_mean: float | None = None, p_h_max: float | None = None,
+                     ablauf_override: pd.DataFrame | None = None) -> str:
+    """Name for the curves of one selection and probability setting, for a
+    caller that keeps them (build_raster_for_bbox's curves_path). Includes the
+    ETags of the probability lookup and the p_Ablauf table on S3, so a new
+    delivery gets new curves; gold itself is immutable."""
+    s3 = get_s3_client()
+    etags = [s3.head_object(Bucket=S3_BUCKET_GOLD, Key=key)['ETag']
+             for key in (DATA_LAKE_PROBABILITIES_RATES_LOOKUP, DATA_LAKE_PROBABILITIES_RATES_ABLAUF)]
+    ablauf = None if ablauf_override is None else ablauf_override.to_json(orient='split', double_precision=15)
+    payload = json.dumps([_CURVES_FORMAT, normalize_selection(selection), p_h_mean, p_h_max, ablauf, etags],
+                         sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+# Bump when the curves' content or layout changes, so kept curves are rebuilt.
+_CURVES_FORMAT = 1
 
 
 # Deliberately wide range, not a single number -- and recalibrated 2026-08-17
@@ -866,30 +1004,58 @@ def estimate_raster_duration_seconds(n_kacheln: int) -> tuple[float, float]:
     return (n_kacheln * _RASTER_SECONDS_PER_KACHEL_LOW, n_kacheln * _RASTER_SECONDS_PER_KACHEL_HIGH)
 
 
+RASTER_TEMP_DIR = '/tmp/duckdb_raster_temp_maxi'
+RASTER_TEMP_MAX_AGE_S = 7 * 24 * 3600
+
+
+def sweep_raster_temp(tmp_dir: str = RASTER_TEMP_DIR, now: float | None = None) -> int:
+    """Deletes every entry of tmp_dir older than RASTER_TEMP_MAX_AGE_S and
+    returns how many. A job deletes its own folder when it ends, but not when
+    its process is killed (a pod restart, an OOM kill), and on the stages
+    /tmp is a volume that outlives the pod. Also takes the loose
+    raster_work_*.db and spill files of versions before per-job folders.
+    No running job is anywhere near that old."""
+    cutoff = (time.time() if now is None else now) - RASTER_TEMP_MAX_AGE_S
+    removed = 0
+    for entry in os.scandir(tmp_dir):
+        try:
+            if entry.stat(follow_symlinks=False).st_mtime >= cutoff:
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                shutil.rmtree(entry.path, ignore_errors=True)
+            else:
+                os.remove(entry.path)
+            removed += 1
+        except OSError:
+            continue  # another job's sweep got there first
+    return removed
+
+
 def build_raster_for_bbox(selection, mode, variable='depth', threshold=1.0,
                           return_period=300, out_dir=None,
                           progress_callback=None, *,
                           p_h_mean: float | None = None, p_h_max: float | None = None,
-                          ablauf_override: pd.DataFrame | None = None) -> list[str]:
-    """Build default-scenario raster(s) for an LV95 area from the S3 gold
-    lake. `selection` is either a plain (xmin, ymin, xmax, ymax) bbox tuple,
-    or the unified {'type': 'bbox'|'polygon', 'ring': [[E, N], ...]} shape
-    (see normalize_selection) for an arbitrary drawn polygon.
+                          ablauf_override: pd.DataFrame | None = None,
+                          curves_path: str | None = None) -> list[str]:
+    """Default-scenario raster(s) for an LV95 area from the S3 gold lake.
+    `selection` is either a plain (xmin, ymin, xmax, ymax) bbox tuple, or the
+    unified {'type': 'bbox'|'polygon', 'ring': [[E, N], ...]} shape (see
+    normalize_selection) for an arbitrary drawn polygon.
 
-    Same signature/contract as build_raster.build_raster_for_bbox, minus the
-    index DB (kachel existence is a per-kachel S3 404 check, see
-    _bind_gold_tile, not a local Hive directory listing) and minus
-    `variante` (MIDI's build_raster.py has several scenario variants; MAXI
-    gold only ever computes the one default scenario, so there was never a
-    second value that parameter could actually take here).
+    Mode 'a': one GeoTIFF, the return period at which `variable` reaches
+    `threshold` ({variable}_at_{threshold}{unit}_{bbox}.tif). Mode 'b': one
+    GeoTIFF per variable, the intensity at `return_period`
+    ({variable}_rp{T}_{bbox}.tif). Returns the paths written; a raster
+    without any pixel is left out.
 
-    Raises RasterBboxTooLargeError if the selection's bounding rectangle
-    spans more kacheln than this host can safely hold in memory at once (see
-    max_raster_kacheln) -- checked before any connection opens or any data
-    is read. That cap is based on the bounding rectangle regardless of the
-    selection's true shape: gold is only ever fetched per whole 1 km tile,
-    so a thin/oddly-shaped polygon costs the same to fetch as a rectangle
-    covering its own bounding box.
+    Two steps: build_exceedance_curves reads gold (the slow part: minutes per
+    dense kachel), raster_from_curves turns the curves into the rasters
+    (seconds). With curves_path, curves already there are reused, and
+    missing ones are built there and kept -- the caller owns that file, and
+    must key it by curves_cache_key. Without it they go to a temp file.
+
+    Raises RasterBboxTooLargeError (before any data is read) if the selection
+    is too large to build, see check_raster_size.
 
     Expert-mode overrides (probe_explorer's "Experten-Modus"), default None
     = production behavior: p_h_mean/p_h_max override the two global
@@ -898,70 +1064,24 @@ def build_raster_for_bbox(selection, mode, variable='depth', threshold=1.0,
     (unlike compute_ifk_default) -- a raster can touch thousands of distinct
     id_anriss, too many to scope a client edit to sensibly (decision
     2026-08-20). Output GeoTIFFs get an `expert_mode` tag (see _expert_tags)
-    when any override is active; the kachel-count cap above is unchanged
-    for expert-mode requests.
+    when any override is active.
     """
     selection = normalize_selection(selection)
     out_dir = out_dir or os.path.expanduser('~/probe_data/maxi_rasters')
     os.makedirs(out_dir, exist_ok=True)
-    # MAXI-specific name (not MIDI's '/tmp/duckdb_raster_temp'): MIDI runs as
-    # root and creates that dir first with 0755 perms, which locks bojan's
-    # MAXI process out of it entirely (os.makedirs(exist_ok=True) is a no-op
-    # against an already-existing root-owned dir, so the failure only shows
-    # up later as "Permission denied" on the per-job db file below).
-    tmp_dir = '/tmp/duckdb_raster_temp_maxi'
-    os.makedirs(tmp_dir, exist_ok=True)
-    kacheln = kacheln_for_bbox(*selection_bounds(selection))
-    _max_kacheln = max_raster_kacheln()
-    if len(kacheln) > _max_kacheln:
-        raise RasterBboxTooLargeError(
-            f"Gebiet umfasst {len(kacheln)} Kacheln (~{len(kacheln)} km²) — mehr als das für dieses "
-            f"System sichere Maximum von {_max_kacheln} (RAM: {psutil.virtual_memory().total / 1e9:.1f} GB). "
-            f"Bitte ein kleineres Gebiet wählen."
-        )
-
-    # On-disk temp DB so DuckDB can spill (':memory:' ignores temp_directory).
-    tmp_db = os.path.join(tmp_dir, f'raster_work_{os.getpid()}_{uuid.uuid4().hex}.db')
-    _config = {
-        'preserve_insertion_order': False,
-        'temp_directory': tmp_dir,
-        'memory_limit': safe_duckdb_memory_limit(),
-        # threads from the cgroup quota, not the node's CPU count: 8 threads
-        # against a 4-CPU pod limit buys no speed and doubles the number of
-        # concurrent spill files.
-        'threads': container_cpu_limit(),
-    }
-    # Bound the on-disk spill when the deployment says how much room there is.
-    # DuckDB's default is "90% of available disk space", measured against the
-    # NODE's filesystem -- it cannot see an emptyDir sizeLimit, so it spills
-    # until the kubelet evicts the pod. Measured 2026-09-16 on the Hosttech
-    # rehearsal: >21.6 GB for one bbox, pod evicted twice, job never finished
-    # (NOTES.md, rehearsal finding 3). With the cap, an oversized job fails
-    # with a clear DuckDB error instead of the pod being killed under it.
-    _max_temp = duckdb_max_temp_directory_size()
-    if _max_temp:
-        _config['max_temp_directory_size'] = _max_temp
-    con = duckdb.connect(tmp_db, config=_config)
+    owned = curves_path is None
+    if owned:
+        os.makedirs(RASTER_TEMP_DIR, exist_ok=True)
+        curves_path = os.path.join(RASTER_TEMP_DIR, f'curves_{os.getpid()}_{uuid.uuid4().hex}.parquet')
     try:
-        con.execute("INSTALL httpfs; LOAD httpfs;")
-        configure_s3_for_duckdb(con)
-        if selection['type'] == 'polygon':
-            # Only loaded for an actual polygon clip -- the far more common
-            # plain-rectangle path never pays for it (ST_Contains isn't
-            # needed there at all, see _bind_gold_tile).
-            con.execute("INSTALL spatial; LOAD spatial;")
-        _register_ablauf(con, ablauf_override)
-        _extra_tags = _expert_tags(p_h_mean, p_h_max, ablauf_override)
-        if mode == 'a':
-            result = _run_mode_a(con, variable, threshold, selection, out_dir, kacheln, progress_callback,
-                                  p_h_mean=p_h_mean, p_h_max=p_h_max, extra_tags=_extra_tags)
-            return [result] if result else []
-        return _run_mode_b(con, return_period, selection, out_dir, kacheln, progress_callback,
-                            p_h_mean=p_h_mean, p_h_max=p_h_max, extra_tags=_extra_tags)
+        if not os.path.exists(curves_path):
+            build_exceedance_curves(selection, curves_path, progress_callback, p_h_mean=p_h_mean,
+                                    p_h_max=p_h_max, ablauf_override=ablauf_override)
+        if progress_callback:
+            progress_callback(1, 1, "Schreibe GeoTIFF…")
+        return raster_from_curves(curves_path, selection, mode, variable=variable, threshold=threshold,
+                                  return_period=return_period, out_dir=out_dir,
+                                  extra_tags=_expert_tags(p_h_mean, p_h_max, ablauf_override))
     finally:
-        con.close()
-        for _f in [tmp_db, tmp_db + '.wal']:
-            try:
-                os.remove(_f)
-            except FileNotFoundError:
-                pass
+        if owned and os.path.exists(curves_path):
+            os.remove(curves_path)
