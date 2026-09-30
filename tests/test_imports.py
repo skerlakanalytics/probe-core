@@ -28,7 +28,6 @@ def test_import_has_no_side_effects(tmp_path):
     env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}
     result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    assert not (tmp_path / "probe_explorer" / "local_state").exists(), \
-        "no local state since 2026-09-27 (catalog and gold manifest come from S3)"
-    assert not (tmp_path / "probe_explorer" / ".cache_maxi").exists(), \
-        "the envelope cache dir must be created on first write, not on import"
+    assert not any(tmp_path.iterdir()), \
+        "import must not write to HOME: no local state since 2026-09-27 (catalog and " \
+        "gold manifest come from S3), and the envelope cache is created on first write"

@@ -1,11 +1,11 @@
-"""MAXI derivate: per-event GeoTIFF/envelope export for probe_explorer.
+"""MAXI derivate: per-event GeoTIFF/envelope export for pgr-atlas.
 
 Pure geometry/raster computation over an already-fetched gold DataFrame — no
-data access lives here. probe_explorer's data_interface.py (S3-backed,
+data access lives here. data_lake/data_interface.py (S3-backed,
 GoldNotReadyError-gated) fetches the raw rows; app.py hands the resulting
 DataFrame to the functions below to turn it into bytes/GeoJSON for the UI.
-The two repos are coupled by design (probe_explorer imports this module via
-sys.path, same convention as the older maxi_ifk_and_raster.py import); no
+The two repos are coupled by design (pgr-atlas imports this module, like
+maxi_ifk_and_raster.py); no
 probabilities are used here since gold-SIM doesn't carry them yet (see
 data_interface.py's module docstring — pending the enrich phase).
 """
@@ -27,9 +27,9 @@ from shapely.geometry import shape
 PIXEL_SIZE = 5
 CRS_LV95 = "EPSG:2056"
 # Envelope cache (one GeoJSON per event). PROBE_CACHE_DIR overrides the
-# location (the Bedag stages mount a volume at the default). Created on first
-# write, not on import -- importing this module has no side effects.
-CACHE_DIR = Path(os.getenv("PROBE_CACHE_DIR") or "~/probe_explorer/.cache_maxi").expanduser()
+# location (pgr-atlas's image and stages set it). Created on first write, not
+# on import -- importing this module has no side effects.
+CACHE_DIR = Path(os.getenv("PROBE_CACHE_DIR") or "~/.cache/probe-core").expanduser()
 
 
 def event_layer_geotiff_bytes(df: pd.DataFrame, col: str) -> bytes:

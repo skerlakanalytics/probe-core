@@ -328,7 +328,7 @@ GEBAEUDESCHATTEN_SCHEMA_SIM_ZEROED_DUCKDB = {
 # Any-building visualization raster (2026-09-07): a per-kachel GeoTIFF answering
 # "is this 5m cell inside/touching ANY building" (unlike own_building_mask
 # above, which is scoped per id_start for the zeroing use case) -- purely a
-# map backdrop for probe_explorer, unrelated to gold's zeroing logic. Same
+# map backdrop for pgr-atlas, unrelated to gold's zeroing logic. Same
 # 0/1/2 encoding, 1 supersedes 2 where both any-building conditions would
 # apply. See derivate/build_gebaeudeschatten_building_mask.py.
 DATA_LAKE_DIR_GEBAEUDESCHATTEN_DERIVATE_BUILDING_MASK = f"{DATA_LAKE_DIR_GEBAEUDESCHATTEN_DERIVATE}/building_mask"
@@ -596,7 +596,7 @@ GOLD_SORT_COLS = ["x", "y", "id_anriss", "A", "h", "mu", "xsi", "tau0"]
 # In-file sort for SIM_ANRISS (data_lake/build_silver_to_gold_anriss.py) — follows
 # the actual drill-down access pattern (anriss -> A -> h -> mu/xsi/tau0),
 # not GOLD_SORT_COLS' spatial one: x,y last since they're not a filter
-# dimension today (probe_explorer fetches one whole anriss and filters the
+# dimension today (pgr-atlas fetches one whole anriss and filters the
 # parameter combo client-side, see app.py's anriss_all_scenarios_cache) —
 # this ordering costs nothing now and sets up cleanly for a future version
 # that pushes the full (id_anriss, A, h, mu, xsi, tau0) filter into SQL
@@ -633,7 +633,7 @@ GOLD_MAX_REACH_M = 1500
 # Both need it, independently — hull fragments are their own consumer of raw
 # silver (never gold), so gold's filter alone doesn't reach them; the two must
 # stay consistent since the hulls are what backs _event_relevant_kacheln()'s
-# bbox and probe_explorer's client-facing map display.
+# bbox and pgr-atlas's client-facing map display.
 # Pixels farther than this from their anriss (Euclidean distance from pixel
 # center (x, y) to anriss center (X_rel_center, Y_rel_center) — decision
 # Bojan 2026-08-10: deliberately a circle, not the actual square DEM domain

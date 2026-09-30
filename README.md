@@ -46,7 +46,7 @@ environment is read when a value is used:
 | `PROBE_S3_ENDPOINT_URL` | `https://f712.gos3.io` | S3 endpoint |
 | `HOSTTECH_BERLIN_OBJECT_STORAGE_ACCESS_KEY` / `_KEY_SECRET` | — | S3 credentials |
 | `PROBE_S3_BUCKET` | `maxi` | the one bucket everything is read from (gold, catalog, derivates, tilesets); `PROBE_S3_BUCKET_GOLD` before 0.7.0 |
-| `PROBE_CACHE_DIR` | `~/probe_explorer/.cache_maxi` | per-event envelope GeoJSON cache (created on first write) |
+| `PROBE_CACHE_DIR` | `~/.cache/probe-core` (`~/probe_explorer/.cache_maxi` before 0.10.0) | per-event envelope GeoJSON cache (created on first write) |
 | `PROBE_DUCKDB_MAX_TEMP_SIZE` | DuckDB's own | cap for DuckDB spill files |
 | `PROBE_RASTER_MAX_ROWS` | `900000000` | largest on-demand raster, in gold rows read (estimated from the gold file sizes, ~15 min); since 0.9.0 |
 | `https_proxy`, `http_proxy`, `no_proxy` | — | egress proxy, also applied to DuckDB |
