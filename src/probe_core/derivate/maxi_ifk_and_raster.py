@@ -81,7 +81,7 @@ _TO_DISPLAY = {'depth': 1 / 100.0, 'velocity': 1 / 100.0, 'pressure': 1.0}
 
 # p_h has no lookup: gold carries h and d (bodengruendigkeit) on every row.
 # _p_h_sql/_lambda_ereignis_sql take optional p_h_mean/p_h_max -- expert mode
-# (probe_explorer's "Experten-Modus", decision 2026-08-20): a client can
+# (pgr-atlas's "Experten-Modus", decision 2026-08-20): a client can
 # override the two global weights (and, via ablauf_override/anriss_overrides
 # elsewhere in this module, p_Ablauf and per-id_anriss lambda_Hangmuren/
 # p_raeumlich/p_A) for an ad-hoc what-if recompute. None means "use the
@@ -325,7 +325,7 @@ def _assert_valid_lambda_ereignis(con: duckdb.DuckDBPyConnection, table_sql: str
     that omits lambda_Hangmuren makes every zero row fail this assertion
     (fails closed, not open, on a caller mistake). Deliberately NOT handled
     by removing these id_anriss from probability_lookup.parquet instead:
-    enrich_with_probabilities() (probe_explorer's single-anriss Rohdaten
+    enrich_with_probabilities() (pgr-atlas's single-anriss Rohdaten
     export) is exhaustive over its input and hard-fails on any id_anriss
     missing from the lookup -- removing them would fix this assertion but
     break that raw-data path for exactly these anrisse. Keeping them in the
@@ -367,7 +367,7 @@ def _register_ablauf(con: duckdb.DuckDBPyConnection, ablauf_override: pd.DataFra
 
 def load_default_ablauf() -> pd.DataFrame:
     """The production p_Ablauf table as a plain DataFrame -- used by
-    probe_explorer's Experten-Modus to seed its editable copy (same S3 read
+    pgr-atlas's Experten-Modus to seed its editable copy (same S3 read
     path as _register_ablauf's default branch, just returned as a
     DataFrame instead of bound into a connection)."""
     con = duckdb.connect()
@@ -457,7 +457,7 @@ def compute_ifk_default(x: float, y: float, *, p_h_mean: float | None = None,
     p_exceedance, return_period)}, 'anriss_events': df, 'ereignisse': df,
     'expert_mode': bool}. Intensities are in display units (m, m/s, kN/m²).
 
-    Expert-mode overrides (probe_explorer's "Experten-Modus", all optional,
+    Expert-mode overrides (pgr-atlas's "Experten-Modus", all optional,
     default None = production behavior, byte-for-byte unchanged from before
     expert mode existed): p_h_mean/p_h_max override the two global
     GOLD_P_H_MEAN/MAX weights, ablauf_override replaces the full p_Ablauf
@@ -548,7 +548,7 @@ def enrich_with_probabilities(df: pd.DataFrame) -> pd.DataFrame:
     factors) onto an arbitrary in-memory SIM gold DataFrame -- the same
     probability_lookup + ablauf join compute_ifk_default uses for one pixel
     (_bind_probability_lookup/_register_ablauf/_p_h_sql/_lambda_ereignis_sql),
-    reused here rather than duplicated so probe_explorer/app.py's
+    reused here rather than duplicated so pgr-atlas's app.py
     single-anriss "Rohdaten" download (every pixel/parameter-combo row of one
     id_anriss, not just one pixel) computes lambda_Ereignis the exact same way the
     IFK curves do.
@@ -988,7 +988,7 @@ _CURVES_FORMAT = 1
 # far more precise than it can actually be -- LOW/HIGH below are ~p10/~p90
 # of that real sample, not the full min/max, to keep the range from being
 # dominated by the single most extreme outlier either direction. This is a
-# rough sizing hint for the UI (see probe_explorer/app.py's Raster-Karten
+# rough sizing hint for the UI (see pgr-atlas's app.py Raster-Karten
 # sidebar) shown only before a job has processed anything yet -- once it
 # has, the sidebar switches to a live estimate from that job's own actual
 # pace, which is always better than this static guess.
@@ -1057,7 +1057,7 @@ def build_raster_for_bbox(selection, mode, variable='depth', threshold=1.0,
     Raises RasterBboxTooLargeError (before any data is read) if the selection
     is too large to build, see check_raster_size.
 
-    Expert-mode overrides (probe_explorer's "Experten-Modus"), default None
+    Expert-mode overrides (pgr-atlas's "Experten-Modus"), default None
     = production behavior: p_h_mean/p_h_max override the two global
     GOLD_P_H_MEAN/MAX weights; ablauf_override replaces the full p_Ablauf
     table (see _register_ablauf). No per-anriss override parameter here

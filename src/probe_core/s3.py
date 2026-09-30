@@ -174,7 +174,7 @@ def s3_presigned_url(bucket_name, key, expires=86400):
     file. Not pinned to a specific object version: if the underlying key gets
     overwritten before the URL is used (or expires), it resolves to whatever
     is current at request time, not what was there when the URL was signed
-    (probe_explorer's Derivate view, 2026-08-25 -- fine there since that
+    (pgr-atlas's Derivate view, 2026-08-25 -- fine there since that
     pipeline's output is immutable per config_hash except a deliberate
     manual --force rebuild, in which case serving the corrected version is
     the desired behavior anyway)."""

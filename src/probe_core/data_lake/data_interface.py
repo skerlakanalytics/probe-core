@@ -1,6 +1,6 @@
 """Read-side access to the data lake: id_kachel spatial math, Data-Lake-Silver
 scans (backing derivate scripts), and Data-Lake-Gold/catalog access (backing
-probe_explorer's Streamlit app). No build/write logic lives here — that's the
+pgr-atlas's Streamlit app). No build/write logic lives here — that's the
 *_worker.py pipeline modules in workers/. Anything that only needs schema
 *facts* (folder names, column types, constants) belongs in data_lake_schema.py
 instead; this module is for the read *code* that those facts get used by, so
@@ -12,14 +12,14 @@ Consolidated here 2026-08-04 from three previously-separate copies:
   derivate/maxi_ifk_and_raster.py, and monitoring/probe_progress_service.py
   before an earlier pass moved it here.
 - The GOLD/CATALOG sections (EVENT/PIXEL/AREA patterns, catalog stats) were
-  probe_explorer's OWN data_interface.py, a near-identical module duplicated
+  pgr-atlas's OWN data_interface.py, a near-identical module duplicated
   across repos. Merged in so there is exactly one data-lake read layer;
-  probe_explorer/app.py now imports this file directly (sys.path, same
+  pgr-atlas's app.py now imports this module (at first via sys.path, same
   pattern already used for probe_control_center/derivate/maxi_event_export).
   kacheln_touching_bbox() and kacheln_in_bbox() were the same bbox->kacheln
   computation under two names with swapped argument order — unified as
   kacheln_in_bbox(xmin, ymin, xmax, ymax) (shapely/geopandas' own bbox
-  convention), the name+order probe_explorer's call sites already used.
+  convention), the name+order pgr-atlas's call sites already used.
 
 Two local, non-gold data sources feed the GOLD/CATALOG sections below:
 - The event manifest (config/app.yaml event_manifest) is the
@@ -36,7 +36,7 @@ S3, backed by a local manifest (refresh_gold_manifest) that tracks which
 kacheln are finalized and raises GoldNotReadyError for anything not yet
 complete.
 
-Design rules for the GOLD/CATALOG half (carried over from probe_explorer,
+Design rules for the GOLD/CATALOG half (carried over from the app's own copy,
 still worth keeping now this is a shared module):
 - No Streamlit imports. UI concerns (caching decorators, spinners, progress
   bars) live in the app; long-running functions take an optional
@@ -198,7 +198,7 @@ def kacheln_in_bbox(xmin: float, ymin: float, xmax: float, ymax: float) -> list[
 # BY. Measured 2026-08-04: 93,017 silver files, 397 GB, at only ~7.6% of the
 # campaign's ~1.23M target batches -- projects to ~5.2 TB at completion. An
 # unbatched pass over that is the same failure mode that crashed the WSL box
-# in probe_explorer/overview_preprocessing.py (real disk space, not just
+# in pgr-atlas's scripts/tilesets/overview_preprocessing.py (real disk space, not just
 # memory -- see that script's module docstring), and this connection doesn't
 # set memory_limit/temp_directory either.
 #
@@ -212,7 +212,7 @@ TARGET_BATCH_FILES = 1000
 # The real ceiling is the Windows host's C: drive (the WSL virtual disk lives
 # on it as a file) -- `df` on the WSL side reports the virtual disk's own
 # headroom, not the real constraint. Duplicated from
-# probe_explorer/overview_preprocessing.py (separate repos, not imported).
+# pgr-atlas's scripts/tilesets/overview_preprocessing.py (separate repos, not imported).
 _WINDOWS_HOST_MOUNT = Path("/mnt/c")
 MIN_FREE_GB_TO_START = 5.0
 MIN_FREE_GB_PER_BATCH = 1.0
@@ -498,7 +498,7 @@ def get_anriss_hull_fragment(id_anriss: int) -> dict:
     an upper bound on any ONE parameter combo's footprint (built from every
     combo pooled together), but usually far smaller than a fixed 3000m box.
 
-    Only ever called for the map-display use (probe_explorer/app.py's
+    Only ever called for the map-display use (pgr-atlas's app.py:
     precomputed_hull_cache) — _event_relevant_kacheln (gold-read gating,
     the other historical caller) goes through the much cheaper _anriss_bbox
     instead (2026-08-11 split, see _hull_fragment_lookup's docstring for the
@@ -536,7 +536,7 @@ def _anriss_bbox(id_anriss: int) -> tuple[float, float, float, float]:
     Cached independently of get_anriss_hull_fragment, not derived from it —
     deliberately simple (no cross-cache peeking) rather than checking
     whether get_anriss_hull_fragment already has this id_anriss cached and
-    reusing its bbox for free. In probe_explorer/app.py's actual call order
+    reusing its bbox for free. In pgr-atlas's app.py, the actual call order
     today (get_anriss_hull_fragment always runs first, for the map overlay,
     before _event_relevant_kacheln needs a bbox), that means this pays for
     its own ~0.7s S3 read even though the answer was technically already in
@@ -582,7 +582,7 @@ def _event_relevant_kacheln(id_anriss: int) -> tuple[list[int], tuple[float, flo
 def get_anriss_all_scenarios_gold_data(id_anriss: int) -> pd.DataFrame:
     """S3: raw gold-lake rows for EVERY simulated parameter combination of
     one anriss (used for the cross-scenario footprint envelope, and as the
-    single wide read probe_explorer/app.py filters client-side per
+    single wide read pgr-atlas's app.py filters client-side per
     A/h/mu/xsi/tau0 dropdown change rather than re-reading S3 per combo —
     see its anriss_all_scenarios_cache).
 
@@ -648,7 +648,7 @@ def get_anriss_sim_data(id_anriss: int) -> pd.DataFrame:
     data, ~5x faster on a sample kachel, growing to ~76x for large-footprint
     events — see docs/claude-memory/project_gold_row_group_size_benchmark.md).
 
-    Wired into probe_explorer/app.py as the primary path (try this first,
+    Wired into pgr-atlas's app.py as the primary path (try this first,
     catch SimAnrissNotIndexedError and fall back to
     get_anriss_all_scenarios_gold_data() for an anriss whose range isn't
     scattered yet) — confirmed still current 2026-08-25, see
