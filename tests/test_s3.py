@@ -125,6 +125,9 @@ def test_configure_s3_for_duckdb_no_region_by_default(no_s3_env):
 def test_boto_client_is_path_style_with_region(monkeypatch, no_s3_env):
     monkeypatch.setenv("PROBE_S3_ENDPOINT_URL", "https://x7ba-s3-kakbfe.infra.be.ch:10443")
     monkeypatch.setenv("PROBE_S3_REGION", "ch-bern-1")
+    # Signing a URL needs a key (no request is made); CI has none.
+    monkeypatch.setenv("PROBE_S3_ACCESS_KEY_ID", "test-key")
+    monkeypatch.setenv("PROBE_S3_SECRET_ACCESS_KEY", "test-secret")
     monkeypatch.setattr(s3, "_S3_CLIENT", None)
     client = s3.get_s3_client()
     monkeypatch.setattr(s3, "_S3_CLIENT", None)
