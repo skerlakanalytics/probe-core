@@ -1,6 +1,6 @@
 [project]
 name = "probe-core"
-version = "0.9.0"
+version = "0.10.0"
 description = "Shared S3 access, data-lake schema and read layer, and derivate computations of the Pro-BE Äxplorer / MAXI projects"
 readme = "README.md"
 authors = [
@@ -11,7 +11,7 @@ requires-python = ">=3.12"
 # ProBE_control_center) pin their own exact versions. Lower bounds are the
 # versions the code was tested with in pgr-atlas (2026-09).
 dependencies = [
-    "boto3>=1.34",
+    "boto3>=1.36",  # request_checksum_calculation (s3.py)
     "duckdb>=1.4,<2",
     "geopandas>=1.0,<2",
     "numpy>=1.26,<3",

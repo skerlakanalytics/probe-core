@@ -5,9 +5,22 @@ Settings come from the environment, read when they are used rather than at
 import time, so an entry point may load a .env file after importing this module:
 
     PROBE_S3_ENDPOINT_URL                       default https://f712.gos3.io
-    HOSTTECH_BERLIN_OBJECT_STORAGE_ACCESS_KEY   S3 key
-    HOSTTECH_BERLIN_OBJECT_STORAGE_KEY_SECRET   S3 secret
+    PROBE_S3_REGION                             signing region; unset = client default
+    PROBE_S3_ACCESS_KEY_ID                      S3 key
+    PROBE_S3_SECRET_ACCESS_KEY                  S3 secret
     https_proxy / http_proxy / no_proxy         egress proxy, see _duckdb_proxy_for
+
+The key variables were HOSTTECH_BERLIN_OBJECT_STORAGE_ACCESS_KEY / _KEY_SECRET
+before 0.10.0; those names still work as a fallback, so deployments can switch
+one at a time. The new names say nothing about the provider because the same
+code reads Hosttech (Ceph) and Bedag (StorageGRID).
+
+Both providers are addressed path-style (https://<endpoint>/<bucket>/<key>):
+Bedag's network policy allows exactly the endpoint's host name, so the
+virtual-host style (<bucket>.<endpoint>) would be blocked, and Hosttech serves
+both. Checksums are sent only where the S3 API requires them: boto3 >= 1.36
+adds CRC checksums to every request by default, which several S3-compatible
+stores reject (same settings as pgr-atlas's tools/s3/s3m.py).
 
 Until 2026-09-18 this lived in utils.py of pgr-atlas and ProBE_control_center,
 next to Ray and DEM helpers that stay in the pipeline, and it called
@@ -25,20 +38,24 @@ DEFAULT_S3_ENDPOINT = "https://f712.gos3.io"
 
 
 class _S3Config(Mapping):
-    """The S3 settings as a read-only mapping ("endpoint_url", "access_key",
-    "secret_key") whose values are looked up in the environment on every
-    access. Same keys as the former module-level dict, so existing
-    S3_CONFIG["..."] call sites keep working."""
+    """The S3 settings as a read-only mapping ("endpoint_url", "region",
+    "access_key", "secret_key") whose values are looked up in the environment
+    on every access. Same keys as the former module-level dict, so existing
+    S3_CONFIG["..."] call sites keep working. Each key lists its variables in
+    order of precedence; the last entry is the default."""
 
     _ENV = {
         "endpoint_url": ("PROBE_S3_ENDPOINT_URL", DEFAULT_S3_ENDPOINT),
-        "access_key": ("HOSTTECH_BERLIN_OBJECT_STORAGE_ACCESS_KEY", None),
-        "secret_key": ("HOSTTECH_BERLIN_OBJECT_STORAGE_KEY_SECRET", None),
+        "region": ("PROBE_S3_REGION", None),
+        "access_key": ("PROBE_S3_ACCESS_KEY_ID",
+                       "HOSTTECH_BERLIN_OBJECT_STORAGE_ACCESS_KEY", None),
+        "secret_key": ("PROBE_S3_SECRET_ACCESS_KEY",
+                       "HOSTTECH_BERLIN_OBJECT_STORAGE_KEY_SECRET", None),
     }
 
     def __getitem__(self, key):
-        var, default = self._ENV[key]
-        return os.getenv(var, default)
+        *names, default = self._ENV[key]
+        return next((os.environ[n] for n in names if os.environ.get(n)), default)
 
     def __iter__(self):
         return iter(self._ENV)
@@ -48,6 +65,16 @@ class _S3Config(Mapping):
 
 
 S3_CONFIG = _S3Config()
+
+# boto3 settings shared by get_s3_client and get_s3_resource; see the module
+# docstring for why path-style and checksums "when_required".
+_BOTO_CONFIG = dict(
+    s3={"addressing_style": "path"},
+    request_checksum_calculation="when_required",
+    response_checksum_validation="when_required",
+    retries={'max_attempts': 10, 'mode': 'adaptive'},
+    max_pool_connections=50,  # Better for 32-core machines
+)
 
 # Client singletons, created on first use (after the entry point has set up
 # its environment), once per process.
@@ -94,6 +121,9 @@ def configure_s3_for_duckdb(con):
     con.execute(f"SET s3_secret_access_key='{S3_CONFIG['secret_key']}'")
     endpoint = S3_CONFIG["endpoint_url"].removeprefix("https://").removeprefix("http://")
     con.execute(f"SET s3_endpoint='{endpoint}'")
+    con.execute("SET s3_url_style='path'")
+    if S3_CONFIG["region"]:
+        con.execute(f"SET s3_region='{S3_CONFIG['region']}'")
     proxy = _duckdb_proxy_for(endpoint.split("/")[0])
     if proxy:
         address, username, password = proxy
@@ -112,12 +142,10 @@ def get_s3_client():
         _S3_CLIENT = boto3.client(
             's3',
             endpoint_url=S3_CONFIG["endpoint_url"],
+            region_name=S3_CONFIG["region"],
             aws_access_key_id=S3_CONFIG["access_key"],
             aws_secret_access_key=S3_CONFIG["secret_key"],
-            config=Config(
-                retries={'max_attempts': 10, 'mode': 'adaptive'},
-                max_pool_connections=50 # Better for 32-core machines
-            )
+            config=Config(**_BOTO_CONFIG),
         )
     return _S3_CLIENT
 
@@ -130,12 +158,10 @@ def get_s3_resource():
         _S3_RESOURCE = boto3.resource(
             's3',
             endpoint_url=S3_CONFIG["endpoint_url"],
+            region_name=S3_CONFIG["region"],
             aws_access_key_id=S3_CONFIG["access_key"],
             aws_secret_access_key=S3_CONFIG["secret_key"],
-            config=Config(
-                retries={'max_attempts': 10, 'mode': 'adaptive'},
-                max_pool_connections=50
-            )
+            config=Config(**_BOTO_CONFIG),
         )
     return _S3_RESOURCE
 

@@ -44,14 +44,38 @@ def test_no_proxy_wildcard_is_not_honoured(monkeypatch):
     assert s3._duckdb_proxy_for("x7ba-s3-kakbfe.infra.be.ch") is not None
 
 
-def test_s3_config_reads_environment_on_access(monkeypatch):
-    monkeypatch.delenv("PROBE_S3_ENDPOINT_URL", raising=False)
-    monkeypatch.delenv("HOSTTECH_BERLIN_OBJECT_STORAGE_ACCESS_KEY", raising=False)
+S3_VARS = ["PROBE_S3_ENDPOINT_URL", "PROBE_S3_REGION",
+           "PROBE_S3_ACCESS_KEY_ID", "PROBE_S3_SECRET_ACCESS_KEY",
+           "HOSTTECH_BERLIN_OBJECT_STORAGE_ACCESS_KEY", "HOSTTECH_BERLIN_OBJECT_STORAGE_KEY_SECRET"]
+
+
+@pytest.fixture
+def no_s3_env(monkeypatch):
+    for var in S3_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_s3_config_reads_environment_on_access(monkeypatch, no_s3_env):
     assert s3.S3_CONFIG["endpoint_url"] == s3.DEFAULT_S3_ENDPOINT
     assert s3.S3_CONFIG["access_key"] is None
-    monkeypatch.setenv("HOSTTECH_BERLIN_OBJECT_STORAGE_ACCESS_KEY", "set-after-import")
+    assert s3.S3_CONFIG["region"] is None
+    monkeypatch.setenv("PROBE_S3_ACCESS_KEY_ID", "set-after-import")
     assert s3.S3_CONFIG["access_key"] == "set-after-import"
-    assert sorted(dict(s3.S3_CONFIG)) == ["access_key", "endpoint_url", "secret_key"]
+    assert sorted(dict(s3.S3_CONFIG)) == ["access_key", "endpoint_url", "region", "secret_key"]
+
+
+def test_s3_config_falls_back_to_hosttech_names(monkeypatch, no_s3_env):
+    """The pre-0.10.0 names still work; the new ones win when both are set
+    (an empty new variable counts as unset)."""
+    monkeypatch.setenv("HOSTTECH_BERLIN_OBJECT_STORAGE_ACCESS_KEY", "old-key")
+    monkeypatch.setenv("HOSTTECH_BERLIN_OBJECT_STORAGE_KEY_SECRET", "old-secret")
+    monkeypatch.setenv("PROBE_S3_SECRET_ACCESS_KEY", "")
+    assert s3.S3_CONFIG["access_key"] == "old-key"
+    assert s3.S3_CONFIG["secret_key"] == "old-secret"
+    monkeypatch.setenv("PROBE_S3_ACCESS_KEY_ID", "new-key")
+    monkeypatch.setenv("PROBE_S3_SECRET_ACCESS_KEY", "new-secret")
+    assert s3.S3_CONFIG["access_key"] == "new-key"
+    assert s3.S3_CONFIG["secret_key"] == "new-secret"
 
 
 class FakeCon:
@@ -75,3 +99,37 @@ def test_configure_s3_for_duckdb_without_proxy(monkeypatch):
     con = FakeCon()
     s3.configure_s3_for_duckdb(con)
     assert not any("http_proxy" in sql for sql in con.statements)
+
+
+def test_configure_s3_for_duckdb_bedag(monkeypatch, no_s3_env):
+    """Bedag: endpoint with a port, a signing region, path-style, and no proxy
+    for .be.ch (the port must not break the no_proxy match)."""
+    monkeypatch.setenv("PROBE_S3_ENDPOINT_URL", "https://x7ba-s3-kakbfe.infra.be.ch:10443")
+    monkeypatch.setenv("PROBE_S3_REGION", "ch-bern-1")
+    monkeypatch.setenv("https_proxy", "http://proxy.kb-bedag.ch:8080")
+    monkeypatch.setenv("no_proxy", "localhost, .be.ch")
+    con = FakeCon()
+    s3.configure_s3_for_duckdb(con)
+    assert "SET s3_endpoint='x7ba-s3-kakbfe.infra.be.ch:10443'" in con.statements
+    assert "SET s3_url_style='path'" in con.statements
+    assert "SET s3_region='ch-bern-1'" in con.statements
+    assert not any("http_proxy" in sql for sql in con.statements)
+
+
+def test_configure_s3_for_duckdb_no_region_by_default(no_s3_env):
+    con = FakeCon()
+    s3.configure_s3_for_duckdb(con)
+    assert not any("s3_region" in sql for sql in con.statements)
+
+
+def test_boto_client_is_path_style_with_region(monkeypatch, no_s3_env):
+    monkeypatch.setenv("PROBE_S3_ENDPOINT_URL", "https://x7ba-s3-kakbfe.infra.be.ch:10443")
+    monkeypatch.setenv("PROBE_S3_REGION", "ch-bern-1")
+    monkeypatch.setattr(s3, "_S3_CLIENT", None)
+    client = s3.get_s3_client()
+    monkeypatch.setattr(s3, "_S3_CLIENT", None)
+    assert client.meta.region_name == "ch-bern-1"
+    assert client.meta.config.s3["addressing_style"] == "path"
+    assert client.meta.config.request_checksum_calculation == "when_required"
+    url = client.generate_presigned_url("get_object", Params={"Bucket": "b", "Key": "k"})
+    assert url.startswith("https://x7ba-s3-kakbfe.infra.be.ch:10443/b/k?")

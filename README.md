@@ -43,13 +43,19 @@ environment is read when a value is used:
 
 | Variable | Default | Used for |
 |---|---|---|
-| `PROBE_S3_ENDPOINT_URL` | `https://f712.gos3.io` | S3 endpoint |
-| `HOSTTECH_BERLIN_OBJECT_STORAGE_ACCESS_KEY` / `_KEY_SECRET` | — | S3 credentials |
+| `PROBE_S3_ENDPOINT_URL` | `https://f712.gos3.io` | S3 endpoint (Hosttech; Bedag's is `https://x7ba-s3-kakbfe.infra.be.ch:10443`) |
+| `PROBE_S3_REGION` | client default | signing region; Bedag needs `ch-bern-1`, Hosttech accepts any. Since 0.10.0 |
+| `PROBE_S3_ACCESS_KEY_ID` / `PROBE_S3_SECRET_ACCESS_KEY` | — | S3 credentials. Before 0.10.0 `HOSTTECH_BERLIN_OBJECT_STORAGE_ACCESS_KEY` / `_KEY_SECRET`, which still work as a fallback (the new names win when both are set) |
 | `PROBE_S3_BUCKET` | `maxi` | the one bucket everything is read from (gold, catalog, derivates, tilesets); `PROBE_S3_BUCKET_GOLD` before 0.7.0 |
 | `PROBE_CACHE_DIR` | `~/.cache/probe-core` (`~/probe_explorer/.cache_maxi` before 0.10.0) | per-event envelope GeoJSON cache (created on first write) |
 | `PROBE_DUCKDB_MAX_TEMP_SIZE` | DuckDB's own | cap for DuckDB spill files |
 | `PROBE_RASTER_MAX_ROWS` | `900000000` | largest on-demand raster, in gold rows read (estimated from the gold file sizes, ~15 min); since 0.9.0 |
 | `https_proxy`, `http_proxy`, `no_proxy` | — | egress proxy, also applied to DuckDB |
+
+S3 requests are path-style (`https://<endpoint>/<bucket>/<key>`) for boto3 and
+DuckDB, and boto3 sends checksums only where the S3 API requires them. Both are
+needed for Bedag's StorageGRID (its network policy allows only the endpoint's
+host name) and work unchanged against Hosttech. Since 0.10.0.
 
 No local state: per-anriss lookups and the catalog totals come from the event
 catalog at the gold bucket's root (`maxi_event_manifest_by_id_anriss.parquet`, sorted by
