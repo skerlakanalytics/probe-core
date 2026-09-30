@@ -257,7 +257,7 @@ wheels = [
 
 [[package]]
 name = "probe-core"
-version = "0.9.0"
+version = "0.10.0"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
@@ -277,7 +277,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "boto3", specifier = ">=1.34" },
+    { name = "boto3", specifier = ">=1.36" },
     { name = "duckdb", specifier = ">=1.4,<2" },
     { name = "geopandas", specifier = ">=1.0,<2" },
     { name = "numpy", specifier = ">=1.26,<3" },
