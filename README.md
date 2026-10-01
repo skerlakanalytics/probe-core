@@ -49,6 +49,7 @@ environment is read when a value is used:
 | `PROBE_S3_BUCKET` | `maxi` | the one bucket everything is read from (gold, catalog, derivates, tilesets); `PROBE_S3_BUCKET_GOLD` before 0.7.0 |
 | `PROBE_CACHE_DIR` | `~/.cache/probe-core` (`~/probe_explorer/.cache_maxi` before 0.10.0) | per-event envelope GeoJSON cache (created on first write) |
 | `PROBE_DUCKDB_MAX_TEMP_SIZE` | DuckDB's own | cap for DuckDB spill files |
+| `PROBE_DUCKDB_MEMORY_FRACTION` | `0.25` | share of the container's (or host's) memory one DuckDB connection may use, above 0 and at most 1; the result stays within 512 MB and 4 GB. Since 0.11.0 |
 | `PROBE_RASTER_MAX_ROWS` | `900000000` | largest on-demand raster, in gold rows read (estimated from the gold file sizes, ~15 min); since 0.9.0 |
 | `https_proxy`, `http_proxy`, `no_proxy` | — | egress proxy, also applied to DuckDB |
 

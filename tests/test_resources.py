@@ -79,3 +79,28 @@ def test_max_temp_directory_size(monkeypatch):
     assert resources.duckdb_max_temp_directory_size() is None
     monkeypatch.setenv("PROBE_DUCKDB_MAX_TEMP_SIZE", "90GiB")
     assert resources.duckdb_max_temp_directory_size() == "90GiB"
+
+
+def test_duckdb_memory_limit_is_a_quarter_by_default(cgroup, monkeypatch):
+    monkeypatch.delenv("PROBE_DUCKDB_MEMORY_FRACTION", raising=False)
+    cgroup["/sys/fs/cgroup/memory.max"] = str(8 * GiB)
+    assert resources.safe_duckdb_memory_limit() == "2048MB"
+
+
+def test_duckdb_memory_fraction_from_the_environment(cgroup, monkeypatch):
+    monkeypatch.setenv("PROBE_DUCKDB_MEMORY_FRACTION", "0.4")
+    cgroup["/sys/fs/cgroup/memory.max"] = str(8 * GiB)
+    assert resources.safe_duckdb_memory_limit() == "3276MB"
+
+
+def test_duckdb_memory_limit_keeps_its_ceiling(cgroup, monkeypatch):
+    monkeypatch.setenv("PROBE_DUCKDB_MEMORY_FRACTION", "1")
+    cgroup["/sys/fs/cgroup/memory.max"] = str(8 * GiB)
+    assert resources.safe_duckdb_memory_limit() == "4096MB"
+
+
+@pytest.mark.parametrize("value", ["0", "-0.5", "1.5", "half"])
+def test_duckdb_memory_fraction_rejects_nonsense(monkeypatch, value):
+    monkeypatch.setenv("PROBE_DUCKDB_MEMORY_FRACTION", value)
+    with pytest.raises(ValueError, match="PROBE_DUCKDB_MEMORY_FRACTION"):
+        resources.duckdb_memory_fraction()
