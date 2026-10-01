@@ -24,7 +24,7 @@ import psutil
 # (2026-08-16: an unconstrained raster job OOM-killed the entire WSL VM, not
 # just the Streamlit process, on a 15 GB dev box -- this app has to stay
 # safe on "whichever system it runs on", not just the box it was built on).
-_DUCKDB_MEMORY_FRACTION = 0.25
+_DUCKDB_MEMORY_FRACTION = 0.25  # default; PROBE_DUCKDB_MEMORY_FRACTION overrides it
 _DUCKDB_MEMORY_LIMIT_MIN_BYTES = 512 * 1024 * 1024       # floor -- below this DuckDB can't do useful work at all
 _DUCKDB_MEMORY_LIMIT_MAX_BYTES = 4 * 1024 * 1024 * 1024  # ceiling -- several connections can coexist (one per session/thread), so no single one gets to claim an unbounded share
 
@@ -86,12 +86,32 @@ def duckdb_max_temp_directory_size() -> str | None:
     return os.getenv('PROBE_DUCKDB_MAX_TEMP_SIZE') or None
 
 
+def duckdb_memory_fraction() -> float:
+    """Share of this process's RAM that one DuckDB connection may use: 0.25,
+    or PROBE_DUCKDB_MEMORY_FRACTION (above 0, at most 1).
+
+    A deployment that runs little besides DuckDB can raise it, so large
+    rasters spill less; the [512MB, 4GB] clamp below still applies."""
+    raw = os.getenv('PROBE_DUCKDB_MEMORY_FRACTION')
+    if not raw:
+        return _DUCKDB_MEMORY_FRACTION
+    try:
+        fraction = float(raw)
+    except ValueError:
+        fraction = 0.0
+    if not 0 < fraction <= 1:
+        raise ValueError(
+            f"PROBE_DUCKDB_MEMORY_FRACTION must be a number above 0 and at most 1, got {raw!r}")
+    return fraction
+
+
 def safe_duckdb_memory_limit() -> str:
     """DuckDB memory_limit string (e.g. '2048MB'), sized to a safe fraction
-    of the RAM this process may actually use and clamped to [512MB, 4GB] --
+    of the RAM this process may actually use (duckdb_memory_fraction) and
+    clamped to [512MB, 4GB] --
     so the same code behaves safely on an 8 GB laptop, a 64 GB server, or a
     memory-capped container alike, instead of a value tuned for one box."""
     total = container_memory_limit_bytes()
-    budget = min(max(int(total * _DUCKDB_MEMORY_FRACTION), _DUCKDB_MEMORY_LIMIT_MIN_BYTES),
+    budget = min(max(int(total * duckdb_memory_fraction()), _DUCKDB_MEMORY_LIMIT_MIN_BYTES),
                  _DUCKDB_MEMORY_LIMIT_MAX_BYTES)
     return f"{budget // (1024 * 1024)}MB"
