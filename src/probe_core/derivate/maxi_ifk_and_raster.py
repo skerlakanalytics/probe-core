@@ -1,37 +1,30 @@
-"""MAXI gold lake derivate: default-scenario IFK and rasters, per-km² kacheln.
+"""MAXI gold lake derivates: IFK curves and on-demand rasters, default scenario.
 
-Reads the S3-backed per-km² Hive gold lake (Data-Lake-Gold/SIM_SPATIAL/
-id_kachel=NNNNNNNN/data.parquet, schema data_lake/data_lake_schema.py's
-GOLD_SCHEMA_SIM_DUCKDB) — same S3 access data_lake/data_interface.py uses for
-the map view (GOLD_S3_ROOT, _s3_gold_connection). The kacheln ARE the spatial index:
-a pixel/bbox query opens only the touched kachel files, and row-group
-pruning on the leading (x, y) sort handles the rest.
+Reads the per-km² gold lake on S3 (Data-Lake-Gold/SIM_SPATIAL/
+id_kachel=NNNNNNNN/data.parquet, schema GOLD_SCHEMA_SIM_DUCKDB). The kacheln
+are the spatial index: a pixel or bbox query opens only the touched kachel
+files, and row-group pruning on the leading (x, y) sort does the rest.
 
-Only the default scenario is computed (decision Bojan 2026-07-16 for the MAXI explorer): all data, p_h computed inline from gold's own h/d
-columns (h == d -> GOLD_P_H_MEAN, else GOLD_P_H_MAX — SIM gold carries no
-p_h column), lambda_Hangmuren/p_raeumlich/p_A joined from the small
-per-id_anriss probability lookup (derivate/build_probability_lookup.py,
-Data-Lake-Probabilities-Rates/probability_lookup.parquet), p_Ablauf from the
-geo7 table ablaufwahrscheinlichkeiten.csv (same folder, matches the
-36-combination MAXI grid, sums to 1). p_A is NULL-free as of the 2026-08-11
-Xurce redelivery (the 6
-rows that had NULL p_A were patched at the source, see
-docs/claude-memory/project_maxi_delivery_qa.md) -- _assert_valid_lambda_ereignis
-below crashes loudly on a recurrence rather than silently dropping rows.
+Gold carries no probabilities. They are joined at query time (_events_sql):
 
     lambda_Ereignis = lambda_Hangmuren · p_raeumlich · p_A · p_h · p_Ablauf
 
-Decision 2026-08-13 (see docs/claude-memory/project_gold_kachel_design.md):
-a live join against the small probability lookup + the tiny p_Ablauf table,
-not a materialized ENRICHED gold lake. lambda_Hangmuren/p_raeumlich/p_A are
-per-id_anriss scalars — baking them onto every pixel row of every simulation
-(what a full ENRICHED lake would do) would duplicate a tiny table across
-gold's billions of rows and force a full lake rewrite on every probability
-correction; a small, cheaply-rebuildable lookup avoids both. The probability
-lookup is reduced to just the touched id_anriss before joining (same
-memory-conscious pattern as workers/data_lake_gold_worker.py's
-GoldCompactWorker.compact_kachel — its kachel_lookup reduction is exactly
-why the original full-lookup join OOM'd and got fixed this way).
+    lambda_Hangmuren, p_raeumlich, p_A   per id_anriss, from the probability lookup
+                                         (Data-Lake-Probabilities-Rates/probability_lookup.parquet,
+                                         built by the pipeline's derivate/build_probability_lookup.py)
+    p_h                                  from gold's own h and d: h == d -> GOLD_P_H_MEAN,
+                                         else GOLD_P_H_MAX
+    p_Ablauf                             per (mu, xsi, tau0), from ablaufwahrscheinlichkeiten.csv
+                                         (the 36 combinations of the MAXI grid, sums to 1)
+
+A live join, not a materialized ENRICHED lake (decision 2026-08-13): the
+factors are per-id_anriss scalars, so baking them in would repeat a tiny table
+over billions of gold rows and force a lake rewrite on every correction. The
+lookup has ~61M rows and is reduced to the touched id_anriss before joining
+(_bind_probability_lookup); joining it whole ran out of memory.
+
+History and rationale: probe_control_center's docs/claude-memory/
+(project_gold_kachel_design.md, project_gebaeudeschatten_derivate_code_history.md).
 """
 
 import hashlib
@@ -76,46 +69,52 @@ ABLAUF_CSV_S3 = f"s3://{S3_BUCKET_GOLD}/{DATA_LAKE_PROBABILITIES_RATES_ABLAUF}"
 
 # Explorer-facing intensity names (m / m/s / kN/m²) → gold columns (cm / cm/s / kPa).
 # kPa == kN/m², so Druck needs no conversion; the cm columns divide by 100.
-_GOLD_COL   = {'depth': 'Fliesstiefe', 'velocity': 'Fliessgeschwindigkeit', 'pressure': 'Druck'}
-_TO_DISPLAY = {'depth': 1 / 100.0, 'velocity': 1 / 100.0, 'pressure': 1.0}
+_GOLD_COLUMN     = {'depth': 'Fliesstiefe', 'velocity': 'Fliessgeschwindigkeit', 'pressure': 'Druck'}
+_TO_DISPLAY_UNIT = {'depth': 1 / 100.0, 'velocity': 1 / 100.0, 'pressure': 1.0}
 
+# ── lambda_Ereignis: the one join every IFK curve and raster is built on ──────
 # p_h has no lookup: gold carries h and d (bodengruendigkeit) on every row.
-# _p_h_sql/_lambda_ereignis_sql take optional p_h_mean/p_h_max -- expert mode
-# (pgr-atlas's "Experten-Modus", decision 2026-08-20): a client can
-# override the two global weights (and, via ablauf_override/anriss_overrides
-# elsewhere in this module, p_Ablauf and per-id_anriss lambda_Hangmuren/
-# p_raeumlich/p_A) for an ad-hoc what-if recompute. None means "use the
-# production default" -- every call site defaults to None, so normal
-# (non-expert) behavior is byte-for-byte unchanged from before expert mode
-# existed.
+# The optional p_h_mean/p_h_max are expert mode (pgr-atlas's "Experten-Modus",
+# decision 2026-08-20): a client can override the two global weights (and, via
+# ablauf_override/anriss_overrides, p_Ablauf and per-id_anriss lambda_Hangmuren/
+# p_raeumlich/p_A) for a what-if recompute. None = the production value.
 def _p_h_sql(p_h_mean: float | None = None, p_h_max: float | None = None) -> str:
+    """p_h of a gold row: h == d is the mean-thickness variant, anything else the max one."""
     mean = GOLD_P_H_MEAN if p_h_mean is None else p_h_mean
     max_ = GOLD_P_H_MAX if p_h_max is None else p_h_max
-    return f"(CASE WHEN dg.h = dg.d THEN {mean} ELSE {max_} END)"
+    return f"(CASE WHEN h = d THEN {mean} ELSE {max_} END)"
 
 
 def _lambda_ereignis_sql(p_h_mean: float | None = None, p_h_max: float | None = None) -> str:
-    # lambda_ereignis should never be NULL or negative in gold-joined data, and
-    # (with no expert-mode override, and outside the lambda_Hangmuren=0
-    # exception) never exactly zero either. The only known way to get
-    # p_raeumlich == 0 is bodengruendigkeit (d) == 0 (confirmed row-level
-    # across all 61.3M Xurce rows, zero exceptions) -- but those 5,091
-    # anrisse are dropped from the SIMULATION manifest entirely, before any
-    # simulation runs (pre_processing_MAXI.py's `WHERE bodengruendigkeit >
-    # 0`), so their id_anriss can never appear as a gold row to join against
-    # in the first place; p_h and p_ablauf are never 0 either in the
-    # production defaults (p_ablauf's minimum is ~7.8e-4). So a zero/
-    # negative lambda_ereignis surviving this join, for any OTHER reason, means
-    # some invariant broke upstream -- see _assert_valid_lambda_ereignis, which
-    # fails loudly on that rather than silently dropping it. Two known
-    # legitimate exceptions to "never exactly zero": an active expert-mode
-    # override (a client CAN legitimately drive a factor to exactly 0, e.g.
-    # p_h_max=0 -- allow_zero) and lambda_Hangmuren=0, confirmed real in the
-    # current Xurce delivery for 52 prozessquellen / 8,114 real simulated
-    # id_anriss (2026-09-11, see _assert_valid_lambda_ereignis's docstring) --
-    # both tolerated by _assert_valid_lambda_ereignis without weakening the NULL
-    # check or the "anything else" zero check.
-    return f'pl.lambda_Hangmuren * pl.p_raeumlich * pl."p_A" * {_p_h_sql(p_h_mean, p_h_max)} * ab.p_ablauf'
+    """lambda_Ereignis of a gold row joined with probability_lookup and ablauf
+    (see _events_sql). Columns are unqualified, so it works under any table
+    alias. What values are legitimate: _assert_valid_lambda_ereignis."""
+    return f'lambda_Hangmuren * p_raeumlich * "p_A" * {_p_h_sql(p_h_mean, p_h_max)} * p_ablauf'
+
+
+def _events_sql(gold_table: str, p_h_mean: float | None = None, p_h_max: float | None = None) -> str:
+    """SELECT every row of `gold_table` (one simulation at one pixel) with the
+    probability factors of its event and their product, lambda_ereignis:
+
+        gold row --id_anriss--------> probability_lookup  (lambda_Hangmuren, p_raeumlich, p_A)
+                 --(mu, xsi, tau0)--> ablauf              (p_ablauf)
+                 --its own h, d-----> p_h
+
+    Needs the temp tables/views `probability_lookup` (_bind_probability_lookup)
+    and `ablauf` (_register_ablauf). Inner joins: a row without a match in
+    either drops out. p_h_mean/p_h_max: expert mode, None = production value."""
+    return f"""
+        SELECT gold.*,
+               lookup.lambda_Hangmuren,
+               lookup.p_raeumlich,
+               lookup."p_A",
+               {_p_h_sql(p_h_mean, p_h_max)} AS p_h,
+               ablauf.p_ablauf,
+               {_lambda_ereignis_sql(p_h_mean, p_h_max)} AS lambda_ereignis
+        FROM {gold_table} AS gold
+        JOIN probability_lookup AS lookup USING (id_anriss)
+        JOIN ablauf USING (mu, xsi, tau0)
+    """
 
 # ── Raster grid constants + helpers (formerly shared with build_raster.py,
 # MIDI-era, removed 2026-07-18 — these are schema-agnostic DataFrame→GeoTIFF
@@ -160,79 +159,68 @@ def assert_lv95_grid_phase(coords, *, edge: bool, resolution: float = RESOLUTION
             f"LV95 -- a center/edge mixup here silently misaligns or corrupts the raster.")
 
 
-# Sanity ceiling for _make_grid's width/height -- generous enough to cover
-# a canton-wide mosaic (the full DEM bbox is ~25200x23600 px at 5m, see
-# hilbert_bern.py's docstring) with real margin, but tight enough to catch
-# garbage x/y values from upstream data corruption fast: a raw OverflowError
-# ("Python int too large to convert to C long") from rasterio.open sizing an
-# absurd array is cryptic and gives no hint it's a DATA problem, not a
-# rasterio one (2026-08-25: hit for real from a DuckDB temp-directory spill
-# collision corrupting a kachel's x/y values -- see build_raster_derivate.py's
-# worker_temp_dir docstring for the actual bug; this check doesn't fix that
-# class of corruption, it just fails loud and fast instead of cryptically).
+# Largest plausible grid side. The canton-wide DEM is ~25200 x 23600 px at 5 m;
+# anything beyond this is corrupted x/y upstream (2026-08-25: a DuckDB spill
+# collision), reported as such instead of as rasterio's OverflowError.
 _MAX_GRID_DIM_PX = 100_000
 
 
-def _make_grid(df: pd.DataFrame):
-    res  = RESOLUTION
-    xmin = float(df['x'].min())
-    xmax = float(df['x'].max())
-    ymin = float(df['y'].min())
-    ymax = float(df['y'].max())
-    width  = round((xmax - xmin) / res) + 1
-    height = round((ymax - ymin) / res) + 1
+def _make_grid(pixels: pd.DataFrame):
+    """(width, height, column index, row index, transform) of the smallest
+    grid holding every pixel CENTER in `pixels` (columns x, y)."""
+    resolution = RESOLUTION
+    xmin = float(pixels['x'].min())
+    xmax = float(pixels['x'].max())
+    ymin = float(pixels['y'].min())
+    ymax = float(pixels['y'].max())
+    width  = round((xmax - xmin) / resolution) + 1
+    height = round((ymax - ymin) / resolution) + 1
     if width > _MAX_GRID_DIM_PX or height > _MAX_GRID_DIM_PX or width < 1 or height < 1:
         raise ValueError(
             f"_make_grid: computed grid {width}x{height} px is outside the sane "
             f"[1, {_MAX_GRID_DIM_PX}] range (x: [{xmin}, {xmax}], y: [{ymin}, {ymax}]) -- "
             f"almost certainly corrupted/garbage x/y values upstream, not a real raster size."
         )
-    col_idx = np.round((df['x'].values - xmin) / res).astype(np.int32)
-    row_idx = np.round((ymax - df['y'].values) / res).astype(np.int32)
-    transform = from_origin(xmin - res / 2, ymax + res / 2, res, res)
-    return width, height, col_idx, row_idx, transform
+    column_index = np.round((pixels['x'].values - xmin) / resolution).astype(np.int32)
+    row_index = np.round((ymax - pixels['y'].values) / resolution).astype(np.int32)
+    transform = from_origin(xmin - resolution / 2, ymax + resolution / 2, resolution, resolution)
+    return width, height, column_index, row_index, transform
 
 
-def _write_single_band(df: pd.DataFrame, value_col: str, out_path: str, tags: dict) -> None:
-    width, height, col_idx, row_idx, transform = _make_grid(df)
-    arr = np.full((height, width), np.nan, dtype=np.float32)
-    arr[row_idx, col_idx] = df[value_col].values.astype(np.float32)
-
-    profile = {
+def _geotiff_profile(width: int, height: int, band_count: int, transform) -> dict:
+    return {
         'driver': 'COG', 'dtype': 'float32',
-        'width': width, 'height': height, 'count': 1,
+        'width': width, 'height': height, 'count': band_count,
         'crs': CRS.from_epsg(CRS_EPSG), 'transform': transform,
         'nodata': NODATA, 'compress': 'deflate',
         'blocksize': 512, 'overview_resampling': 'average',
     }
-    with rasterio.open(out_path, 'w', **profile) as dst:
-        dst.write(arr, 1)
-        dst.update_tags(1, **tags)
-    print(f"  → {out_path}  ({width}×{height} px, {df[value_col].notna().sum():,} pixels with data)")
 
 
-def _write_multiband(df: pd.DataFrame, value_cols: list[str], out_path: str, tags: dict) -> None:
-    """Same grid/profile as _write_single_band, one band per column in
-    value_cols (band N's description set to that column's name, for GIS
-    tools that display it) -- used by derivate/build_raster_derivate.py to
-    write one GeoTIFF per kachel covering its whole precompute matrix,
-    instead of one file per (mode, variable, threshold/RP) combo."""
-    width, height, col_idx, row_idx, transform = _make_grid(df)
-    profile = {
-        'driver': 'COG', 'dtype': 'float32',
-        'width': width, 'height': height, 'count': len(value_cols),
-        'crs': CRS.from_epsg(CRS_EPSG), 'transform': transform,
-        'nodata': NODATA, 'compress': 'deflate',
-        'blocksize': 512, 'overview_resampling': 'average',
-    }
-    with rasterio.open(out_path, 'w', **profile) as dst:
-        for i, col in enumerate(value_cols, start=1):
-            arr = np.full((height, width), np.nan, dtype=np.float32)
-            arr[row_idx, col_idx] = df[col].values.astype(np.float32)
-            dst.write(arr, i)
-            dst.set_band_description(i, col)
-        dst.update_tags(**tags)
-    print(f"  → {out_path}  ({width}×{height} px, {len(value_cols)} band(s))")
+def _write_single_band(pixels: pd.DataFrame, value_column: str, out_path: str, tags: dict) -> None:
+    width, height, column_index, row_index, transform = _make_grid(pixels)
+    band = np.full((height, width), np.nan, dtype=np.float32)
+    band[row_index, column_index] = pixels[value_column].values.astype(np.float32)
+    with rasterio.open(out_path, 'w', **_geotiff_profile(width, height, 1, transform)) as dataset:
+        dataset.write(band, 1)
+        dataset.update_tags(1, **tags)
+    print(f"  → {out_path}  ({width}×{height} px, {pixels[value_column].notna().sum():,} pixels with data)")
+
+
+def _write_multiband(pixels: pd.DataFrame, value_columns: list[str], out_path: str, tags: dict) -> None:
+    """Same grid and profile as _write_single_band, one band per column in
+    value_columns (the band description is the column name) -- the derivate
+    runner's one GeoTIFF per kachel and metric."""
+    width, height, column_index, row_index, transform = _make_grid(pixels)
+    profile = _geotiff_profile(width, height, len(value_columns), transform)
+    with rasterio.open(out_path, 'w', **profile) as dataset:
+        for band_number, column in enumerate(value_columns, start=1):
+            band = np.full((height, width), np.nan, dtype=np.float32)
+            band[row_index, column_index] = pixels[column].values.astype(np.float32)
+            dataset.write(band, band_number)
+            dataset.set_band_description(band_number, column)
+        dataset.update_tags(**tags)
+    print(f"  → {out_path}  ({width}×{height} px, {len(value_columns)} band(s))")
 
 
 def kachel_s3_file(id_kachel: int) -> str:
@@ -241,9 +229,9 @@ def kachel_s3_file(id_kachel: int) -> str:
 
 def kacheln_for_bbox(xmin, ymin, xmax, ymax) -> list[int]:
     """All id_kachel integers whose 1 km tile overlaps the bbox."""
-    return [e * 10000 + n
-            for e in range(int(xmin // 1000), int(xmax // 1000) + 1)
-            for n in range(int(ymin // 1000), int(ymax // 1000) + 1)]
+    return [east_km * 10000 + north_km
+            for east_km in range(int(xmin // 1000), int(xmax // 1000) + 1)
+            for north_km in range(int(ymin // 1000), int(ymax // 1000) + 1)]
 
 
 # ── Selection: a rectangle OR an arbitrary polygon, unified ──────────────────
@@ -274,14 +262,14 @@ def normalize_selection(selection) -> dict:
 
 def selection_bounds(selection) -> tuple[float, float, float, float]:
     ring = normalize_selection(selection)['ring']
-    xs = [p[0] for p in ring]
-    ys = [p[1] for p in ring]
-    return min(xs), min(ys), max(xs), max(ys)
+    eastings = [point[0] for point in ring]
+    northings = [point[1] for point in ring]
+    return min(eastings), min(northings), max(eastings), max(northings)
 
 
 def _ring_wkt(ring) -> str:
-    pts = ', '.join(f'{x} {y}' for x, y in ring)
-    return f'POLYGON(({pts}))'
+    points = ', '.join(f'{x} {y}' for x, y in ring)
+    return f'POLYGON(({points}))'
 
 
 def _selection_tags(selection, xmin, ymin, xmax, ymax) -> dict:
@@ -303,46 +291,35 @@ def _is_missing_kachel(exc: Exception) -> bool:
 
 def _assert_valid_lambda_ereignis(con: duckdb.DuckDBPyConnection, table_sql: str, context: str,
                              allow_zero: bool = False) -> None:
-    """Raise loudly if any row has a NULL lambda_ereignis, or (unless allow_zero
-    or lambda_Hangmuren=0) a zero/negative one -- see _lambda_ereignis_sql's
-    comment for why NULL and zero/negative should both be impossible in the
-    production default path OTHERWISE. NULL is always checked regardless of
-    allow_zero: it indicates a broken join (missing probability_lookup/
-    ablauf match), never a probability VALUE choice, so an active override
-    never excuses it. allow_zero=True (set by callers when an expert-mode
-    override is active) tolerates any exact 0 -- a client can legitimately
-    drive a factor to 0 (e.g. p_h_max=0), but negative never has a
-    legitimate cause either way.
+    """Raise if any row of `table_sql` (must project lambda_ereignis and
+    lambda_Hangmuren) has an impossible lambda_ereignis:
 
-    lambda_Hangmuren=0 (2026-09-11, see docs/claude-memory/
-    project_maxi_delivery_qa.md): a SECOND, always-on legitimate zero cause,
-    independent of allow_zero/expert-mode. Confirmed real in the current
-    Xurce delivery -- 52 prozessquellen / 8,114 real, simulated id_anriss
-    genuinely deliver lambda_Hangmuren=0 (a real process-source recurrence
-    probability of zero, not a data defect), which zeroes the whole
-    lambda_Ereignis product for every one of their pixels. table_sql MUST project
-    both lambda_ereignis and lambda_Hangmuren for this to be checked -- a query
-    that omits lambda_Hangmuren makes every zero row fail this assertion
-    (fails closed, not open, on a caller mistake). Deliberately NOT handled
-    by removing these id_anriss from probability_lookup.parquet instead:
-    enrich_with_probabilities() (pgr-atlas's single-anriss Rohdaten
-    export) is exhaustive over its input and hard-fails on any id_anriss
-    missing from the lookup -- removing them would fix this assertion but
-    break that raw-data path for exactly these anrisse. Keeping them in the
-    lookup with their real delivered (zero) value, and only relaxing the
-    validation, keeps raw/single-anriss lookups working (correctly showing
-    lambda_Ereignis=0) while every probability-WEIGHTED aggregate (IFK curves,
-    Mode A/B rasters, the raster-derivate batch) naturally excludes their
-    contribution anyway -- a 0-weight row already contributes nothing to a
-    weighted sum, no separate filter needed anywhere."""
-    if allow_zero:
-        cond = "lambda_ereignis IS NULL OR lambda_ereignis < 0"
-    else:
-        cond = "lambda_ereignis IS NULL OR lambda_ereignis < 0 OR (lambda_ereignis = 0 AND lambda_Hangmuren != 0)"
-    n = con.execute(f"SELECT COUNT(*) FROM ({table_sql}) WHERE {cond}").fetchone()[0]
-    if n:
+      NULL      always an error: a broken join, never a probability value.
+      negative  always an error.
+      zero      an error unless one of the two legitimate causes applies:
+                - lambda_Hangmuren = 0: real in the Xurce delivery (52
+                  prozessquellen / 8,114 simulated id_anriss, 2026-09-11, see
+                  docs/claude-memory/project_maxi_delivery_qa.md). A query that
+                  does not project lambda_Hangmuren fails here on every zero
+                  row: closed, not open.
+                - allow_zero: an expert-mode override is active, and a client
+                  may set a factor to 0 (e.g. p_h_max=0).
+
+    Why nothing else can be zero: p_raeumlich = 0 only happens with
+    bodengruendigkeit = 0 (all 61.3M Xurce rows checked), and those 5,091
+    anrisse are never simulated (pre_processing_MAXI.py), so they have no gold
+    rows; p_h and p_ablauf are never 0 in production (p_ablauf >= ~7.8e-4).
+
+    The lambda_Hangmuren = 0 anrisse stay in probability_lookup.parquet on
+    purpose: enrich_with_probabilities hard-fails on an id_anriss missing from
+    the lookup, and a rate of 0 adds nothing to any weighted sum anyway."""
+    invalid = "lambda_ereignis IS NULL OR lambda_ereignis < 0"
+    if not allow_zero:
+        invalid += " OR (lambda_ereignis = 0 AND lambda_Hangmuren != 0)"
+    n_invalid = con.execute(f"SELECT COUNT(*) FROM ({table_sql}) WHERE {invalid}").fetchone()[0]
+    if n_invalid:
         kind = "NULL/negative" if allow_zero else "NULL/zero(non-lambda)/negative"
-        raise ValueError(f"{context}: {n} row(s) with {kind} lambda_ereignis — investigate before "
+        raise ValueError(f"{context}: {n_invalid} row(s) with {kind} lambda_ereignis — investigate before "
                           f"proceeding (see docs/claude-memory/project_maxi_delivery_qa.md)")
 
 
@@ -357,9 +334,9 @@ def _register_ablauf(con: duckdb.DuckDBPyConnection, ablauf_override: pd.DataFra
     function is also directly callable from a script/API caller, not only
     through the explorer -- the invariant has to hold regardless of caller."""
     if ablauf_override is not None:
-        _sum = float(ablauf_override['p_ablauf'].sum())
-        if abs(_sum - 1.0) > _ABLAUF_SUM_TOLERANCE:
-            raise ValueError(f"ablauf_override: p_ablauf sums to {_sum!r}, not 1.0")
+        total = float(ablauf_override['p_ablauf'].sum())
+        if abs(total - 1.0) > _ABLAUF_SUM_TOLERANCE:
+            raise ValueError(f"ablauf_override: p_ablauf sums to {total!r}, not 1.0")
         con.register('ablauf', ablauf_override)
     else:
         con.execute(f"CREATE OR REPLACE TEMP VIEW ablauf AS SELECT * FROM read_csv('{ABLAUF_CSV_S3}')")
@@ -373,9 +350,9 @@ def load_default_ablauf() -> pd.DataFrame:
     con = duckdb.connect()
     con.execute("INSTALL httpfs; LOAD httpfs;")
     configure_s3_for_duckdb(con)
-    df = con.execute(f"SELECT * FROM read_csv('{ABLAUF_CSV_S3}')").df()
+    ablauf = con.execute(f"SELECT * FROM read_csv('{ABLAUF_CSV_S3}')").df()
     con.close()
-    return df
+    return ablauf
 
 
 def _bind_probability_lookup(con: duckdb.DuckDBPyConnection, id_anriss_source_sql: str) -> None:
@@ -384,8 +361,9 @@ def _bind_probability_lookup(con: duckdb.DuckDBPyConnection, id_anriss_source_sq
     a handful to a few thousand)."""
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE probability_lookup AS
-        SELECT pl.* FROM read_parquet('{PROBABILITY_LOOKUP_S3}') pl
-        JOIN ({id_anriss_source_sql}) k USING (id_anriss)
+        SELECT lookup.*
+        FROM read_parquet('{PROBABILITY_LOOKUP_S3}') AS lookup
+        JOIN ({id_anriss_source_sql}) AS touched USING (id_anriss)
     """)
 
 
@@ -410,20 +388,19 @@ def _apply_anriss_overrides(con: duckdb.DuckDBPyConnection, anriss_overrides: di
     the production default."""
     if not anriss_overrides:
         return
-    rows = [{'id_anriss': k, 'lambda_Hangmuren': v.get('lambda_Hangmuren'),
-             'p_raeumlich': v.get('p_raeumlich'), 'p_A': v.get('p_A')}
-            for k, v in anriss_overrides.items()]
-    ov_df = pd.DataFrame(rows).astype({
-        'lambda_Hangmuren': 'Float64', 'p_raeumlich': 'Float64', 'p_A': 'Float64'})
-    con.register('_anriss_overrides', ov_df)
+    factor_names = ['lambda_Hangmuren', 'p_raeumlich', 'p_A']
+    overrides = pd.DataFrame([{'id_anriss': id_anriss, **{name: factors.get(name) for name in factor_names}}
+                              for id_anriss, factors in anriss_overrides.items()])
+    overrides = overrides.astype({name: 'Float64' for name in factor_names})
+    con.register('_anriss_overrides', overrides)
     con.execute("""
         CREATE OR REPLACE TEMP TABLE probability_lookup AS
-        SELECT pl.id_anriss,
-               COALESCE(ov.lambda_Hangmuren, pl.lambda_Hangmuren) AS lambda_Hangmuren,
-               COALESCE(ov.p_raeumlich, pl.p_raeumlich)           AS p_raeumlich,
-               COALESCE(ov."p_A", pl."p_A")                       AS "p_A"
-        FROM probability_lookup pl
-        LEFT JOIN _anriss_overrides ov USING (id_anriss)
+        SELECT lookup.id_anriss,
+               COALESCE(override.lambda_Hangmuren, lookup.lambda_Hangmuren) AS lambda_Hangmuren,
+               COALESCE(override.p_raeumlich,      lookup.p_raeumlich)      AS p_raeumlich,
+               COALESCE(override."p_A",            lookup."p_A")            AS "p_A"
+        FROM probability_lookup AS lookup
+        LEFT JOIN _anriss_overrides AS override USING (id_anriss)
     """)
     con.unregister('_anriss_overrides')
 
@@ -467,141 +444,127 @@ def compute_ifk_default(x: float, y: float, *, p_h_mean: float | None = None,
     (but not NULL or negative) lambda_ereignis is tolerated rather than raising —
     see _assert_valid_lambda_ereignis's allow_zero.
     """
-    _has_overrides = bool(p_h_mean is not None or p_h_max is not None
+    has_overrides = bool(p_h_mean is not None or p_h_max is not None
                           or ablauf_override is not None or anriss_overrides)
     id_kachel = int(x // 1000) * 10000 + int(y // 1000)
-    file = kachel_s3_file(id_kachel)
-    empty = pd.DataFrame(columns=['intensity', 'p_exceedance', 'return_period'])
+    kachel_file = kachel_s3_file(id_kachel)
+    empty_curve = pd.DataFrame(columns=['intensity', 'p_exceedance', 'return_period'])
     result = {'pixel': (x, y),
-              'curves': {v: empty.copy() for v in INTENSITY_VARS},
+              'curves': {variable: empty_curve.copy() for variable in INTENSITY_VARS},
               'anriss_events': pd.DataFrame(columns=['id_anriss', 'x', 'y', 'anrissflaeche', 'lambda_ereignis_sum']),
               'ereignisse': pd.DataFrame(),
-              'expert_mode': _has_overrides}
+              'expert_mode': has_overrides}
 
     con = _s3_gold_connection()
     _register_ablauf(con, ablauf_override)
     try:
         con.execute(f"""
             CREATE TEMP TABLE gold_pixel AS
-            SELECT * FROM read_parquet('{file}') WHERE x = {x} AND y = {y}
+            SELECT *
+            FROM read_parquet('{kachel_file}')
+            WHERE x = {x} AND y = {y}
         """)
-    except duckdb.HTTPException as e:
-        if _is_missing_kachel(e):
+    except duckdb.HTTPException as error:
+        if _is_missing_kachel(error):
             con.close()
             return result
         raise
     _bind_probability_lookup(con, "SELECT DISTINCT id_anriss FROM gold_pixel")
     _apply_anriss_overrides(con, anriss_overrides)
 
+    # Every simulation reaching the pixel, with its rate and display-unit intensities.
     con.execute(f"""
         CREATE TEMP TABLE ereignisse AS
-        SELECT dg.*,
-               dg.Fliesstiefe / 100.0            AS depth,
-               dg.Fliessgeschwindigkeit / 100.0  AS velocity,
-               dg."Druck"                        AS pressure,
-               pl.lambda_Hangmuren,
-               pl.p_raeumlich,
-               pl."p_A",
-               {_p_h_sql(p_h_mean, p_h_max)}     AS p_h,
-               ab.p_ablauf,
-               {_lambda_ereignis_sql(p_h_mean, p_h_max)} AS lambda_ereignis
-        FROM gold_pixel dg
-        JOIN probability_lookup pl USING (id_anriss)
-        JOIN ablauf ab ON dg.mu = ab.mu AND dg.xsi = ab.xsi AND dg.tau0 = ab.tau0
+        WITH events AS ({_events_sql("gold_pixel", p_h_mean, p_h_max)})
+        SELECT *,
+               Fliesstiefe / 100.0           AS depth,
+               Fliessgeschwindigkeit / 100.0 AS velocity,
+               "Druck"                       AS pressure
+        FROM events
     """)
     _assert_valid_lambda_ereignis(con, "SELECT lambda_ereignis, lambda_Hangmuren FROM ereignisse", f"pixel ({x}, {y})",
-                             allow_zero=_has_overrides)
+                             allow_zero=has_overrides)
 
-    for var in INTENSITY_VARS:
-        col, f = _GOLD_COL[var], _TO_DISPLAY[var]
-        # Aggregate on the stored (exact) values, convert to display units after.
-        df = con.execute(f"""
-            WITH agg AS (
-                SELECT "{col}" AS raw_intensity, SUM(lambda_ereignis) AS p_sum
-                FROM ereignisse GROUP BY 1
+    for variable in INTENSITY_VARS:
+        # The IFK curve: per intensity, the summed rate of every event at least
+        # that intense. Grouped on the stored (exact) values, converted to
+        # display units after.
+        curve = con.execute(f"""
+            WITH rate_per_intensity AS (
+                SELECT "{_GOLD_COLUMN[variable]}" AS stored_intensity,
+                       SUM(lambda_ereignis) AS rate
+                FROM ereignisse
+                GROUP BY stored_intensity
             )
-            SELECT raw_intensity * {f} AS intensity,
-                   SUM(p_sum) OVER (ORDER BY raw_intensity DESC
-                                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS p_exceedance
-            FROM agg ORDER BY intensity
+            SELECT stored_intensity * {_TO_DISPLAY_UNIT[variable]} AS intensity,
+                   SUM(rate) OVER (ORDER BY stored_intensity DESC
+                                   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS p_exceedance
+            FROM rate_per_intensity
+            ORDER BY intensity
         """).df()
-        df['return_period'] = 1.0 / df['p_exceedance']
-        result['curves'][var] = df
+        curve['return_period'] = 1.0 / curve['p_exceedance']
+        result['curves'][variable] = curve
 
     result['anriss_events'] = con.execute("""
-        SELECT id_anriss, x_anriss AS x, y_anriss AS y, "A" AS anrissflaeche,
+        SELECT id_anriss,
+               x_anriss AS x,
+               y_anriss AS y,
+               "A"      AS anrissflaeche,
                COALESCE(SUM(lambda_ereignis), 0.0) AS lambda_ereignis_sum
-        FROM ereignisse GROUP BY 1, 2, 3, 4 ORDER BY lambda_ereignis_sum DESC
+        FROM ereignisse
+        GROUP BY id_anriss, x_anriss, y_anriss, "A"
+        ORDER BY lambda_ereignis_sum DESC
     """).df()
     result['ereignisse'] = con.execute("""
         SELECT id_prozessquelle, id_anriss, x_anriss, y_anriss, "A", d, h, mu, xsi, tau0,
                lambda_Hangmuren, p_raeumlich, "p_A", p_h, p_ablauf,
                depth, velocity, pressure, lambda_ereignis
-        FROM ereignisse ORDER BY id_anriss, "A", h, mu, xsi, tau0
+        FROM ereignisse
+        ORDER BY id_anriss, "A", h, mu, xsi, tau0
     """).df()
     con.close()
     return result
 
 
-def enrich_with_probabilities(df: pd.DataFrame) -> pd.DataFrame:
-    """Join lambda_Ereignis (and its lambda_Hangmuren/p_raeumlich/p_A/p_h/p_Ablauf
-    factors) onto an arbitrary in-memory SIM gold DataFrame -- the same
-    probability_lookup + ablauf join compute_ifk_default uses for one pixel
-    (_bind_probability_lookup/_register_ablauf/_p_h_sql/_lambda_ereignis_sql),
-    reused here rather than duplicated so pgr-atlas's app.py
-    single-anriss "Rohdaten" download (every pixel/parameter-combo row of one
-    id_anriss, not just one pixel) computes lambda_Ereignis the exact same way the
-    IFK curves do.
+def enrich_with_probabilities(gold_rows: pd.DataFrame) -> pd.DataFrame:
+    """`gold_rows` (SIM gold rows in memory: id_anriss, mu, xsi, tau0, h, d
+    needed) with lambda_Ereignis and its five factors added, by the same join
+    as the IFK curves (_events_sql) -- pgr-atlas's single-anriss "Rohdaten"
+    export.
 
-    Requires id_anriss, mu, xsi, tau0, h, d columns (GOLD_SCHEMA_SIM_DUCKDB --
-    what get_anriss_sim_data/get_anriss_all_scenarios_gold_data return).
-    Unlike compute_ifk_default's kachel-scoped joins, this is meant to be
-    exhaustive over its input -- every input row is expected to find both a
-    probability_lookup entry AND an ablauf combo, so (unlike the plain inner
-    joins elsewhere in this module) it raises loudly if any row WOULD be
-    dropped, instead of dropping it, and raises if any surviving row still
-    ends up with a NULL/zero/negative lambda_ereignis (see
-    _assert_valid_lambda_ereignis). No expert-mode override parameters -- this
-    feeds the single-anriss Rohdaten export, not the IFK/raster expert-mode
-    surfaces (see compute_ifk_default/build_raster_for_bbox)."""
-    _extra_cols = ['lambda_Hangmuren', 'p_raeumlich', 'p_A', 'p_h', 'p_ablauf', 'lambda_ereignis']
-    if df.empty:
-        return df.assign(**{c: pd.Series(dtype='float64') for c in _extra_cols})
+    Exhaustive, unlike the kachel-scoped joins: a row without a
+    probability_lookup entry or an ablauf combination raises instead of
+    dropping out, and so does an impossible lambda_ereignis (see
+    _assert_valid_lambda_ereignis). No expert-mode overrides."""
+    probability_columns = ['lambda_Hangmuren', 'p_raeumlich', 'p_A', 'p_h', 'p_ablauf', 'lambda_ereignis']
+    if gold_rows.empty:
+        return gold_rows.assign(**{column: pd.Series(dtype='float64') for column in probability_columns})
 
     con = _s3_gold_connection()
     _register_ablauf(con)
-    con.register('gold_rows', df)
+    con.register('gold_rows', gold_rows)
     _bind_probability_lookup(con, "SELECT DISTINCT id_anriss FROM gold_rows")
 
     missing_anriss = con.execute("""
-        SELECT DISTINCT id_anriss FROM gold_rows
+        SELECT DISTINCT id_anriss
+        FROM gold_rows
         ANTI JOIN probability_lookup USING (id_anriss)
     """).df()['id_anriss'].tolist()
     if missing_anriss:
         raise ValueError(f"enrich_with_probabilities: {len(missing_anriss)} id_anriss not found in "
                           f"probability_lookup: {missing_anriss}")
     missing_ablauf = con.execute("""
-        SELECT DISTINCT mu, xsi, tau0 FROM gold_rows dg
-        ANTI JOIN ablauf ab ON dg.mu = ab.mu AND dg.xsi = ab.xsi AND dg.tau0 = ab.tau0
+        SELECT DISTINCT mu, xsi, tau0
+        FROM gold_rows
+        ANTI JOIN ablauf USING (mu, xsi, tau0)
     """).df()
     if not missing_ablauf.empty:
         raise ValueError(f"enrich_with_probabilities: {len(missing_ablauf)} (mu, xsi, tau0) combo(s) not "
                           f"found in ablauf: {missing_ablauf.to_dict('records')}")
 
-    result = con.execute(f"""
-        SELECT dg.*,
-               pl.lambda_Hangmuren, pl.p_raeumlich, pl."p_A",
-               {_p_h_sql()} AS p_h,
-               ab.p_ablauf,
-               {_lambda_ereignis_sql()} AS lambda_ereignis
-        FROM gold_rows dg
-        JOIN probability_lookup pl USING (id_anriss)
-        JOIN ablauf ab ON dg.mu = ab.mu AND dg.xsi = ab.xsi AND dg.tau0 = ab.tau0
-    """).df()
+    result = con.execute(_events_sql("gold_rows")).df()
     con.close()
-    # Same lambda_Hangmuren=0 exception as _assert_valid_lambda_ereignis (see its
-    # docstring) -- a real, legitimate second zero-cause confirmed 2026-09-11,
-    # not just this function's own separate implementation of the same check.
+    # The rules of _assert_valid_lambda_ereignis, on the DataFrame.
     invalid = result['lambda_ereignis'].isna() | (result['lambda_ereignis'] < 0) | \
         ((result['lambda_ereignis'] == 0) & (result['lambda_Hangmuren'] != 0))
     n_invalid = int(invalid.sum())
@@ -624,20 +587,20 @@ def _bind_gold_tile(con, id_kachel, selection) -> bool:
     extra per-row filter for the sliver between the polygon and its own
     bounding box, not a replacement for it."""
     xmin, ymin, xmax, ymax = selection_bounds(selection)
-    _extra_filter = ""
+    inside_polygon = ""
     if selection['type'] == 'polygon':
-        _wkt = _ring_wkt(selection['ring'])
-        _extra_filter = f" AND ST_Contains(ST_GeomFromText('{_wkt}'), ST_Point(x, y))"
+        inside_polygon = f"AND ST_Contains(ST_GeomFromText('{_ring_wkt(selection['ring'])}'), ST_Point(x, y))"
     try:
         con.execute(f"""
             CREATE OR REPLACE TEMP TABLE gold_tile AS
-            SELECT * FROM read_parquet('{kachel_s3_file(id_kachel)}')
+            SELECT *
+            FROM read_parquet('{kachel_s3_file(id_kachel)}')
             WHERE x >= {xmin} AND x <= {xmax}
               AND y >= {ymin} AND y <= {ymax}
-              {_extra_filter}
+              {inside_polygon}
         """)
-    except duckdb.HTTPException as e:
-        if _is_missing_kachel(e):
+    except duckdb.HTTPException as error:
+        if _is_missing_kachel(error):
             return False
         raise
     _bind_probability_lookup(con, "SELECT DISTINCT id_anriss FROM gold_tile")
@@ -654,24 +617,32 @@ def _raw_threshold(variable: str, threshold: float) -> float:
     0.01 .. 6.00 were affected. 6 decimals is far below gold's resolution, so
     a threshold between two stored values (0.075 m -> 7.5 cm) still means
     what it says."""
-    return round(threshold / _TO_DISPLAY[variable], 6)
+    return round(threshold / _TO_DISPLAY_UNIT[variable], 6)
+
+
+def _curve_sql(variable: str) -> str:
+    """SELECT the exceedance curve of one variable from `events`: per pixel and
+    stored intensity (gold's integer unit), exceedance_rate = the summed
+    lambda_ereignis of every event at that pixel with at least that intensity."""
+    return f"""
+        SELECT '{variable}' AS variable, x, y, intensity,
+               SUM(rate) OVER (PARTITION BY x, y ORDER BY intensity DESC
+                               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS exceedance_rate
+        FROM (
+            SELECT x, y, "{_GOLD_COLUMN[variable]}" AS intensity, SUM(lambda_ereignis) AS rate
+            FROM events
+            GROUP BY x, y, "{_GOLD_COLUMN[variable]}"
+        )"""
 
 
 def _curves_insert_sql() -> str:
-    """Appends the current kachel's exceedance curves (from `base`, built and
-    checked by build_exceedance_curves) to `curves`: per variable, pixel and
-    stored intensity i, p = the summed lambda_ereignis of every event at that
-    pixel with intensity >= i (gold's integer unit). Mode A is 1 / p at the
-    smallest i >= the threshold, Mode B the largest i whose p reaches
-    1 / return period -- so one curve answers every threshold and return
-    period of all three variables."""
-    branches = [f"""
-        SELECT '{var}' AS variable, x, y, i,
-               SUM(s) OVER (PARTITION BY x, y ORDER BY i DESC
-                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS p
-        FROM (SELECT x, y, "{_GOLD_COL[var]}" AS i, SUM(lambda_ereignis) AS s
-              FROM base GROUP BY x, y, "{_GOLD_COL[var]}")""" for var in INTENSITY_VARS]
-    return "INSERT INTO curves" + "\n        UNION ALL".join(branches)
+    """Appends the current kachel's exceedance curves (from `events`, built
+    and checked by build_exceedance_curves) to `curves`, one _curve_sql per
+    variable. The exceedance rate falls as the intensity rises, so Mode A is
+    1 / rate at the smallest intensity >= the threshold, Mode B the largest
+    intensity whose rate reaches 1 / return period -- one curve answers every
+    threshold and return period of all three variables."""
+    return "INSERT INTO curves" + "\n        UNION ALL".join(_curve_sql(variable) for variable in INTENSITY_VARS)
 
 
 def _job_connection(job_dir: str) -> duckdb.DuckDBPyConnection:
@@ -727,7 +698,7 @@ def build_exceedance_curves(selection, out_path: str, progress_callback=None, *,
                             p_h_mean: float | None = None, p_h_max: float | None = None,
                             ablauf_override: pd.DataFrame | None = None) -> None:
     """Reads the selection's gold rows kachel by kachel and writes their
-    exceedance curves (see _curves_insert_sql) to the parquet out_path, which
+    exceedance curves (see _curve_sql) to the parquet out_path, which
     raster_from_curves turns into rasters. Written to a temp name and moved
     into place, so an existing out_path is always complete.
 
@@ -740,7 +711,7 @@ def build_exceedance_curves(selection, out_path: str, progress_callback=None, *,
     check_raster_size(selection)
     has_overrides = p_h_mean is not None or p_h_max is not None
     print(f"\n[{datetime.now():%H:%M:%S}] Exceedance curves over {len(kacheln)} kacheln")
-    tmp_path = f"{out_path}.{uuid.uuid4().hex}.tmp"
+    unfinished_path = f"{out_path}.{uuid.uuid4().hex}.tmp"
     with _JobDir() as job_dir:
         con = _job_connection(job_dir)
         try:
@@ -750,37 +721,41 @@ def build_exceedance_curves(selection, out_path: str, progress_callback=None, *,
                 # Only for an actual polygon clip (ST_Contains, _bind_gold_tile).
                 con.execute("INSTALL spatial; LOAD spatial;")
             _register_ablauf(con, ablauf_override)
-            con.execute("CREATE TABLE curves (variable VARCHAR, x DOUBLE, y DOUBLE, i INTEGER, p DOUBLE)")
+            con.execute("""
+                CREATE TABLE curves (
+                    variable VARCHAR, x DOUBLE, y DOUBLE, intensity INTEGER, exceedance_rate DOUBLE)
+            """)
             insert_sql = _curves_insert_sql()
-            for n, id_kachel in enumerate(kacheln):
+            for done, id_kachel in enumerate(kacheln):
                 if progress_callback:
-                    progress_callback(n, len(kacheln), f"Kachel {n + 1}/{len(kacheln)}")
+                    progress_callback(done, len(kacheln), f"Kachel {done + 1}/{len(kacheln)}")
                 if not _bind_gold_tile(con, id_kachel, selection):
                     continue
                 # Materialised once: lambda_ereignis feeds three curves and the
-                # validity check below.
+                # validity check below. Only the columns those need: a dense
+                # kachel has 100M+ rows.
                 con.execute(f"""
-                    CREATE OR REPLACE TEMP TABLE base AS
-                    SELECT dg.x, dg.y, dg."Fliesstiefe", dg."Fliessgeschwindigkeit", dg."Druck",
-                           pl.lambda_Hangmuren, {_lambda_ereignis_sql(p_h_mean, p_h_max)} AS lambda_ereignis
-                    FROM gold_tile dg
-                    JOIN probability_lookup pl USING (id_anriss)
-                    JOIN ablauf ab ON dg.mu = ab.mu AND dg.xsi = ab.xsi AND dg.tau0 = ab.tau0
+                    CREATE OR REPLACE TEMP TABLE events AS
+                    SELECT x, y, "Fliesstiefe", "Fliessgeschwindigkeit", "Druck",
+                           lambda_Hangmuren, lambda_ereignis
+                    FROM ({_events_sql("gold_tile", p_h_mean, p_h_max)})
                 """)
-                _assert_valid_lambda_ereignis(con, "SELECT lambda_ereignis, lambda_Hangmuren FROM base",
+                _assert_valid_lambda_ereignis(con, "SELECT lambda_ereignis, lambda_Hangmuren FROM events",
                                               f"kachel {id_kachel}", allow_zero=has_overrides)
                 con.execute(insert_sql)
             if progress_callback and kacheln:
                 progress_callback(len(kacheln), len(kacheln), "Schreibe Kurven…")
             # Sorted by variable: raster_from_curves reads one variable at a
             # time and skips the other row groups.
-            con.execute(f"COPY (SELECT * FROM curves ORDER BY variable) TO '{tmp_path}' "
-                        f"(FORMAT parquet, COMPRESSION zstd)")
-            os.replace(tmp_path, out_path)
+            con.execute(f"""
+                COPY (SELECT * FROM curves ORDER BY variable)
+                TO '{unfinished_path}' (FORMAT parquet, COMPRESSION zstd)
+            """)
+            os.replace(unfinished_path, out_path)
         finally:
             con.close()
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            if os.path.exists(unfinished_path):
+                os.remove(unfinished_path)
 
 
 def raster_from_curves(curves_path: str, selection, mode: str, *, variable: str = 'depth',
@@ -800,36 +775,46 @@ def raster_from_curves(curves_path: str, selection, mode: str, *, variable: str 
         con = _job_connection(job_dir)
         try:
             if mode == 'a':
-                df = con.execute(f"""
-                    SELECT x, y, 1.0 / MAX(p) AS return_period FROM {curves}
-                    WHERE variable = ? AND i >= ? GROUP BY x, y
+                # The rate falls as the intensity rises: the largest rate at or
+                # above the threshold is the rate of the smallest such intensity.
+                pixels = con.execute(f"""
+                    SELECT x, y, 1.0 / MAX(exceedance_rate) AS return_period
+                    FROM {curves}
+                    WHERE variable = ? AND intensity >= ?
+                    GROUP BY x, y
                 """, [variable, _raw_threshold(variable, threshold)]).df()
-                if df.empty:
+                if pixels.empty:
                     print("  No pixels exceed threshold — skipping.")
                     return []
                 out_path = os.path.join(
                     out_dir, f'{variable}_at_{threshold}{INTENSITY_SUFFIX[variable]}_{bbox_slug}.tif')
-                _write_single_band(df, 'return_period', out_path, {
+                _write_single_band(pixels, 'return_period', out_path, {
                     'mode': 'A', 'variable': variable,
                     'threshold': str(threshold), 'threshold_units': INTENSITY_UNITS[variable],
                     'value_units': 'years (return period)', **tags,
                 })
                 return [out_path]
-            p_thresh = 1.0 / return_period
-            rp_str = str(int(return_period)) if float(return_period) == int(return_period) else str(return_period)
+            min_exceedance_rate = 1.0 / return_period
+            return_period_text = (str(int(return_period)) if float(return_period) == int(return_period)
+                                  else str(return_period))
             out_paths = []
-            for var in INTENSITY_VARS:
-                df = con.execute(f"""
-                    SELECT x, y, MAX(i) * {_TO_DISPLAY[var]!r} AS intensity FROM {curves}
-                    WHERE variable = ? AND p >= ? GROUP BY x, y
-                """, [var, p_thresh]).df()
-                if df.empty:
-                    print(f"  No pixels reach T={return_period} yr for {var} — skipping.")
+            for intensity_variable in INTENSITY_VARS:
+                # The largest intensity still exceeded at least once per return period.
+                pixels = con.execute(f"""
+                    SELECT x, y, MAX(intensity) * {_TO_DISPLAY_UNIT[intensity_variable]!r} AS intensity
+                    FROM {curves}
+                    WHERE variable = ? AND exceedance_rate >= ?
+                    GROUP BY x, y
+                """, [intensity_variable, min_exceedance_rate]).df()
+                if pixels.empty:
+                    print(f"  No pixels reach T={return_period} yr for {intensity_variable} — skipping.")
                     continue
-                out_path = os.path.join(out_dir, f'{var}_rp{rp_str}_{bbox_slug}.tif')
-                _write_single_band(df, 'intensity', out_path, {
-                    'mode': 'B', 'variable': var, 'value_units': INTENSITY_UNITS[var],
-                    'return_period': rp_str, 'exceedance_probability': f'{p_thresh:.2e}', **tags,
+                out_path = os.path.join(out_dir, f'{intensity_variable}_rp{return_period_text}_{bbox_slug}.tif')
+                _write_single_band(pixels, 'intensity', out_path, {
+                    'mode': 'B', 'variable': intensity_variable,
+                    'value_units': INTENSITY_UNITS[intensity_variable],
+                    'return_period': return_period_text,
+                    'exceedance_probability': f'{min_exceedance_rate:.2e}', **tags,
                 })
                 out_paths.append(out_path)
             return out_paths
@@ -837,26 +822,13 @@ def raster_from_curves(curves_path: str, selection, mode: str, *, variable: str 
             con.close()
 
 
-# _run_mode_a/_run_mode_b pull each kachel's matching rows out of DuckDB via
-# .df() and hold them in a plain Python list (`chunks`) for the WHOLE bbox
-# loop, growing until the final pd.concat() -- that accumulation lives in
-# pandas/Python memory, entirely outside whatever the DuckDB connection's own
-# memory_limit tracks (see data_interface.safe_duckdb_memory_limit's
-# docstring). 2026-08-16: a 42x31 km bbox (~1300 kacheln) grew the whole
-# Streamlit process to ~14 GB RSS and got OOM-killed -- along with taking the
-# entire WSL VM down with it, not just the one process. MAX_RASTER_KACHELN
-# below is the actual fix for that failure mode: reject an oversized bbox
-# outright, before opening a connection or reading a single kachel, rather
-# than trying to survive one already in flight.
-#
-# _RASTER_KACHEL_MEMORY_BUDGET_BYTES is a deliberately pessimistic per-kachel
-# worst case (not a measured average) -- a kachel's raw SIM_SPATIAL rows
-# before aggregation can run into the hundreds of thousands (5 m pixels x
-# every id_anriss/A/h/mu/xsi/tau0 combination reaching each one), and this
-# cap has to hold even for an unusually dense kachel, not just a typical one.
-_RASTER_KACHEL_MEMORY_BUDGET_BYTES = 25 * 1024 * 1024  # 25 MB/kachel, worst case
-_RASTER_MAX_MEMORY_FRACTION = 0.25  # leave the rest of the host's RAM for the OS/Streamlit/everything else
-_RASTER_MAX_KACHELN_CEILING = 300   # hard ceiling regardless of host RAM -- past this a single-threaded per-kachel Python loop is also just too slow to be a reasonable synchronous request
+# Kacheln per request: 25 MB per kachel as a pessimistic worst case, against a
+# quarter of the process's memory, and never more than 300. (2026-08-16: a
+# 42x31 km bbox, ~1300 kacheln, grew the app to ~14 GB and took the whole WSL
+# VM down.) check_raster_size rejects a larger selection before anything is read.
+_RASTER_KACHEL_MEMORY_BUDGET_BYTES = 25 * 1024 * 1024
+_RASTER_MAX_MEMORY_FRACTION = 0.25
+_RASTER_MAX_KACHELN_CEILING = 300
 
 
 def max_raster_kacheln() -> int:
@@ -917,9 +889,9 @@ def estimate_raster_rows(selection) -> int:
     sizes = gold_kachel_bytes()
     rows = 0.0
     for id_kachel in kacheln_for_bbox(xmin, ymin, xmax, ymax):
-        e, n = divmod(id_kachel, 10000)
-        share = (max(0.0, min(xmax, (e + 1) * 1000) - max(xmin, e * 1000))
-                 * max(0.0, min(ymax, (n + 1) * 1000) - max(ymin, n * 1000)) / 1e6)
+        east_km, north_km = divmod(id_kachel, 10000)
+        share = (max(0.0, min(xmax, (east_km + 1) * 1000) - max(xmin, east_km * 1000))
+                 * max(0.0, min(ymax, (north_km + 1) * 1000) - max(ymin, north_km * 1000)) / 1e6)
         rows += sizes.get(id_kachel, 0) / _GOLD_BYTES_PER_ROW * share
     return int(rows)
 
@@ -964,34 +936,14 @@ def curves_cache_key(selection, p_h_mean: float | None = None, p_h_max: float | 
 
 
 # Bump when the curves' content or layout changes, so kept curves are rebuilt.
-_CURVES_FORMAT = 1
+# 2: columns i, p renamed to intensity, exceedance_rate.
+_CURVES_FORMAT = 2
 
 
-# Deliberately wide range, not a single number -- and recalibrated 2026-08-17
-# from a real 40-kachel benchmark (build_raster_for_bbox, mode B, one kachel
-# per job) run on silver-to-gold-node, not on a dev laptop: that box (8 vCPU,
-# same Hosttech Berlin DC as the S3 bucket) is the same class of machine
-# app.py actually runs on in production (headnode: also 8 vCPU, also
-# Hosttech Berlin) -- a comparison run from a Zurich dev box over the public
-# internet measured noticeably slower on sparse/empty kacheln (network RTT
-# dominates there) but came out roughly EQUAL on the densest kacheln (~350M+
-# raw rows) despite the worse network path, because at that size the
-# DuckDB join+aggregate itself becomes CPU-bound and the dev box's 16 cores
-# outweighed its network disadvantage against the 8-core DC boxes -- so the
-# dev box's numbers alone would have been a poor stand-in for how this
-# actually performs where it's deployed.
-#
-# The real per-kachel spread measured on that DC box: empty/near-empty tiles
-# ~1s, up to ~400s for the single densest tile (364M raw rows before
-# aggregation). Kachel density varies 1000x+ across the lake (confirmed 0 to
-# ~364M raw rows per km² tile), so a per-kachel constant will always read as
-# far more precise than it can actually be -- LOW/HIGH below are ~p10/~p90
-# of that real sample, not the full min/max, to keep the range from being
-# dominated by the single most extreme outlier either direction. This is a
-# rough sizing hint for the UI (see pgr-atlas's app.py Raster-Karten
-# sidebar) shown only before a job has processed anything yet -- once it
-# has, the sidebar switches to a live estimate from that job's own actual
-# pace, which is always better than this static guess.
+# Rough seconds per kachel, ~p10 and ~p90 of a 40-kachel benchmark on an
+# 8-vCPU node in the bucket's data centre (2026-08-17): ~1 s for an empty
+# kachel, up to ~400 s for the densest (364M rows). Density varies 1000x
+# across the lake, hence a range and not one number.
 _RASTER_SECONDS_PER_KACHEL_LOW = 1.0
 _RASTER_SECONDS_PER_KACHEL_HIGH = 245.0
 

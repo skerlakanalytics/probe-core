@@ -18,11 +18,11 @@ SELECTION = {"type": "bbox", "ring": [[2600000, 1200000], [2600005, 1200000], [2
 @pytest.fixture()
 def curves(tmp_path):
     con = duckdb.connect()
-    con.execute("""CREATE TABLE base (x DOUBLE, y DOUBLE, "Fliesstiefe" INTEGER,
+    con.execute("""CREATE TABLE events (x DOUBLE, y DOUBLE, "Fliesstiefe" INTEGER,
                    "Fliessgeschwindigkeit" INTEGER, "Druck" INTEGER, lambda_ereignis DOUBLE)""")
     for depth, rate in EVENTS:
-        con.execute("INSERT INTO base VALUES (?, ?, ?, ?, ?, ?)", [*PIXEL, depth, depth, depth, rate])
-    con.execute("CREATE TABLE curves (variable VARCHAR, x DOUBLE, y DOUBLE, i INTEGER, p DOUBLE)")
+        con.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)", [*PIXEL, depth, depth, depth, rate])
+    con.execute("CREATE TABLE curves (variable VARCHAR, x DOUBLE, y DOUBLE, intensity INTEGER, exceedance_rate DOUBLE)")
     con.execute(m._curves_insert_sql())
     path = tmp_path / "curves.parquet"
     con.execute(f"COPY curves TO '{path}' (FORMAT parquet)")
@@ -30,7 +30,7 @@ def curves(tmp_path):
 
 
 def test_curve_sums_the_rates_at_or_above_each_intensity(curves):
-    rows = duckdb.sql(f"SELECT i, p FROM '{curves}' WHERE variable = 'depth' ORDER BY i").fetchall()
+    rows = duckdb.sql(f"SELECT intensity, exceedance_rate FROM '{curves}' WHERE variable = 'depth' ORDER BY intensity").fetchall()
     assert rows == [(10, pytest.approx(0.007)), (20, pytest.approx(0.006))]
 
 
