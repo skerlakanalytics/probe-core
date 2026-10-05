@@ -157,9 +157,9 @@ def test_paths():
 
 
 def test_literals_are_numbers_only():
-    assert g._f(2636392.5) == "2636392.5"
-    assert g._ids([3, 1]) == "3, 1"
+    assert g._float_literal(2636392.5) == "2636392.5"
+    assert g._id_list([3, 1]) == "3, 1"
     with pytest.raises(ValueError):
-        g._f("1; DROP TABLE x")
+        g._float_literal("1; DROP TABLE x")
     with pytest.raises(ValueError):
-        g._ids(["1) OR (1=1"])
+        g._id_list(["1) OR (1=1"])
