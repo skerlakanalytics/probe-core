@@ -27,6 +27,7 @@ History and rationale: probe_control_center's docs/claude-memory/
 (project_gold_kachel_design.md, project_gebaeudeschatten_derivate_code_history.md).
 """
 
+import contextlib
 import hashlib
 import json
 import os
@@ -49,7 +50,7 @@ from rasterio.transform import from_origin
 from probe_core.data_lake.data_lake_schema import (  # noqa: F401 (GOLD_MAX_REACH_M is re-exported)
     GOLD_MAX_REACH_M, GOLD_P_H_MEAN, GOLD_P_H_MAX,
     DATA_LAKE_PROBABILITIES_RATES_LOOKUP, DATA_LAKE_PROBABILITIES_RATES_ABLAUF,
-    DATA_LAKE_DIR_GOLD_SIM_SPATIAL,
+    DATA_LAKE_DIR_GOLD_SIM_SPATIAL, GOLD_SCHEMA_SIM_DUCKDB,
 )
 from probe_core.data_lake.data_interface import (
     GOLD_S3_ROOT, S3_BUCKET_GOLD, _s3_gold_connection,
@@ -425,6 +426,46 @@ def _expert_tags(p_h_mean: float | None, p_h_max: float | None,
 
 # ── IFK (default scenario) ────────────────────────────────────────────────────
 
+def _ifk_curve(con: duckdb.DuckDBPyConnection, variable: str) -> pd.DataFrame:
+    """The IFK curve of one variable from the temp table `ereignisse` (one row
+    per event, with the gold intensity columns and lambda_ereignis): per
+    intensity, the summed rate of every event at least that intense. Grouped
+    on the stored (exact) values, converted to display units after.
+
+    Returns df(intensity, p_exceedance, return_period), sorted by intensity."""
+    curve = con.execute(f"""
+        WITH rate_per_intensity AS (
+            SELECT "{_GOLD_COLUMN[variable]}" AS stored_intensity,
+                   SUM(lambda_ereignis) AS rate
+            FROM ereignisse
+            GROUP BY stored_intensity
+        )
+        SELECT stored_intensity * {_TO_DISPLAY_UNIT[variable]} AS intensity,
+               SUM(rate) OVER (ORDER BY stored_intensity DESC
+                               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS p_exceedance
+        FROM rate_per_intensity
+        ORDER BY intensity
+    """).df()
+    curve['return_period'] = 1.0 / curve['p_exceedance']
+    return curve
+
+
+def _anriss_events(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """The Anrisse behind the temp table `ereignisse`, each with the summed
+    rate of its events, largest first: df(id_anriss, x, y, anrissflaeche,
+    lambda_ereignis_sum)."""
+    return con.execute("""
+        SELECT id_anriss,
+               x_anriss AS x,
+               y_anriss AS y,
+               "A"      AS anrissflaeche,
+               COALESCE(SUM(lambda_ereignis), 0.0) AS lambda_ereignis_sum
+        FROM ereignisse
+        GROUP BY id_anriss, x_anriss, y_anriss, "A"
+        ORDER BY lambda_ereignis_sum DESC
+    """).df()
+
+
 def compute_ifk_default(x: float, y: float, *, p_h_mean: float | None = None,
                         p_h_max: float | None = None, ablauf_override: pd.DataFrame | None = None,
                         anriss_overrides: dict | None = None) -> dict:
@@ -486,35 +527,9 @@ def compute_ifk_default(x: float, y: float, *, p_h_mean: float | None = None,
                              allow_zero=has_overrides)
 
     for variable in INTENSITY_VARS:
-        # The IFK curve: per intensity, the summed rate of every event at least
-        # that intense. Grouped on the stored (exact) values, converted to
-        # display units after.
-        curve = con.execute(f"""
-            WITH rate_per_intensity AS (
-                SELECT "{_GOLD_COLUMN[variable]}" AS stored_intensity,
-                       SUM(lambda_ereignis) AS rate
-                FROM ereignisse
-                GROUP BY stored_intensity
-            )
-            SELECT stored_intensity * {_TO_DISPLAY_UNIT[variable]} AS intensity,
-                   SUM(rate) OVER (ORDER BY stored_intensity DESC
-                                   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS p_exceedance
-            FROM rate_per_intensity
-            ORDER BY intensity
-        """).df()
-        curve['return_period'] = 1.0 / curve['p_exceedance']
-        result['curves'][variable] = curve
+        result['curves'][variable] = _ifk_curve(con, variable)
 
-    result['anriss_events'] = con.execute("""
-        SELECT id_anriss,
-               x_anriss AS x,
-               y_anriss AS y,
-               "A"      AS anrissflaeche,
-               COALESCE(SUM(lambda_ereignis), 0.0) AS lambda_ereignis_sum
-        FROM ereignisse
-        GROUP BY id_anriss, x_anriss, y_anriss, "A"
-        ORDER BY lambda_ereignis_sum DESC
-    """).df()
+    result['anriss_events'] = _anriss_events(con)
     result['ereignisse'] = con.execute("""
         SELECT id_prozessquelle, id_anriss, x_anriss, y_anriss, "A", d, h, mu, xsi, tau0,
                lambda_Hangmuren, p_raeumlich, "p_A", p_h, p_ablauf,
@@ -576,28 +591,33 @@ def enrich_with_probabilities(gold_rows: pd.DataFrame) -> pd.DataFrame:
 
 # ── Rasters (default scenario, modes A/B as in build_raster.py) ───────────────
 
+def _selection_where_sql(selection) -> str:
+    """SQL condition for the gold rows whose pixel centre (x, y) lies in the
+    selection.
+
+    The bounding rectangle always comes first (cheap, and matches row-group
+    pruning on the leading (x, y) sort, see module docstring) -- for a
+    'polygon' selection, ST_Contains on top of that is an extra per-row filter
+    for the sliver between the polygon and its own bounding box, not a
+    replacement for it. It needs the spatial extension loaded."""
+    xmin, ymin, xmax, ymax = selection_bounds(selection)
+    where = f"x >= {xmin} AND x <= {xmax} AND y >= {ymin} AND y <= {ymax}"
+    if selection['type'] == 'polygon':
+        where += f" AND ST_Contains(ST_GeomFromText('{_ring_wkt(selection['ring'])}'), ST_Point(x, y))"
+    return where
+
+
 def _bind_gold_tile(con, id_kachel, selection) -> bool:
     """True if the kachel exists (finalized) and was bound; False if a 404
     (not finalized / doesn't exist) — callers skip it, same as an empty
-    kachel used to be skipped when reading a local dir.
-
-    The bounding-rectangle WHERE clause is always applied first (cheap, and
-    matches row-group pruning on the leading (x, y) sort, see module
-    docstring) -- for a 'polygon' selection, ST_Contains on top of that is an
-    extra per-row filter for the sliver between the polygon and its own
-    bounding box, not a replacement for it."""
-    xmin, ymin, xmax, ymax = selection_bounds(selection)
-    inside_polygon = ""
-    if selection['type'] == 'polygon':
-        inside_polygon = f"AND ST_Contains(ST_GeomFromText('{_ring_wkt(selection['ring'])}'), ST_Point(x, y))"
+    kachel used to be skipped when reading a local dir. Which rows:
+    _selection_where_sql."""
     try:
         con.execute(f"""
             CREATE OR REPLACE TEMP TABLE gold_tile AS
             SELECT *
             FROM read_parquet('{kachel_s3_file(id_kachel)}')
-            WHERE x >= {xmin} AND x <= {xmax}
-              AND y >= {ymin} AND y <= {ymax}
-              {inside_polygon}
+            WHERE {_selection_where_sql(selection)}
         """)
     except duckdb.HTTPException as error:
         if _is_missing_kachel(error):
@@ -1037,3 +1057,242 @@ def build_raster_for_bbox(selection, mode, variable='depth', threshold=1.0,
     finally:
         if owned and os.path.exists(curves_path):
             os.remove(curves_path)
+
+
+# ── IFK of an area (rectangle or polygon) ─────────────────────────────────────
+# The rule: a simulation counts once for the area, with its largest intensity
+# over all pixels whose centre lies inside (per variable: the largest depth,
+# velocity and pressure may come from different pixels). The exceedance rate at
+# an intensity is then the summed lambda_ereignis of every simulation whose
+# area maximum reaches it -- never a sum over pixels. So an area's curve lies
+# at or above the curve of every pixel in it, and a one-pixel area gives that
+# pixel's IFK (compute_ifk_default).
+#
+# Two steps, like the rasters: build_area_event_maxima reads gold (the slow
+# part) and keeps one row per simulation; compute_ifk_for_area joins the
+# probabilities onto those rows (seconds). The maxima depend on no
+# probability, so they serve every expert-mode setting and every delivery.
+
+# What identifies a simulation in gold (one row per simulation and pixel), and
+# the columns that depend only on its Anriss.
+_SIMULATION_COLUMNS = ['id_prozessquelle', 'id_anriss', 'x_anriss', 'y_anriss', 'A', 'd', 'h', 'mu', 'xsi', 'tau0']
+_SIMULATION_COLUMNS_SQL = ', '.join(f'"{column}"' for column in _SIMULATION_COLUMNS)
+
+# Bump when the maxima's content or layout changes, so kept maxima are rebuilt.
+_AREA_MAXIMA_FORMAT = 1
+
+
+def _event_maxima_sql(source_sql: str, pixel_count_sql: str, where_sql: str = "TRUE") -> str:
+    """SELECT one row per simulation of `source_sql` with its largest depth,
+    velocity and pressure, under gold's column names (so _events_sql and
+    _ifk_curve read the result like gold rows), and pixel_count."""
+    return f"""
+        SELECT {_SIMULATION_COLUMNS_SQL},
+               MAX("Fliesstiefe")           AS "Fliesstiefe",
+               MAX("Fliessgeschwindigkeit") AS "Fliessgeschwindigkeit",
+               MAX("Druck")                 AS "Druck",
+               ({pixel_count_sql})::BIGINT  AS pixel_count
+        FROM {source_sql}
+        WHERE {where_sql}
+        GROUP BY {_SIMULATION_COLUMNS_SQL}
+    """
+
+
+def _create_event_maxima_per_kachel(con: duckdb.DuckDBPyConnection) -> None:
+    columns = [*_SIMULATION_COLUMNS, 'Fliesstiefe', 'Fliessgeschwindigkeit', 'Druck']
+    columns_sql = ', '.join(f'"{column}" {GOLD_SCHEMA_SIM_DUCKDB[column]}' for column in columns)
+    con.execute(f"CREATE TABLE event_maxima_per_kachel ({columns_sql}, pixel_count BIGINT)")
+
+
+def _insert_kachel_event_maxima(con: duckdb.DuckDBPyConnection, kachel_file: str, selection) -> None:
+    """Appends the maxima of one kachel's simulations over the selection to
+    event_maxima_per_kachel. Aggregated straight from the parquet scan: the
+    selection's raw rows (100M+ in a dense kachel) are never materialised."""
+    con.execute("INSERT INTO event_maxima_per_kachel" + _event_maxima_sql(
+        f"read_parquet('{kachel_file}')", "COUNT(*)", _selection_where_sql(selection)))
+
+
+def _write_event_maxima(con: duckdb.DuckDBPyConnection, out_path: str) -> None:
+    """Writes event_maxima_per_kachel as one row per simulation: a simulation
+    that crosses a kachel border has a row per kachel there."""
+    unfinished_path = f"{out_path}.{uuid.uuid4().hex}.tmp"
+    try:
+        con.execute(f"""
+            COPY ({_event_maxima_sql("event_maxima_per_kachel", "SUM(pixel_count)")})
+            TO '{unfinished_path}' (FORMAT parquet, COMPRESSION zstd)
+        """)
+        os.replace(unfinished_path, out_path)
+    finally:
+        if os.path.exists(unfinished_path):
+            os.remove(unfinished_path)
+
+
+def area_maxima_cache_key(selection) -> str:
+    """Name for the maxima of one selection, for a caller that keeps them
+    (build_area_event_maxima's out_path). The selection alone: gold is
+    immutable and the maxima hold no probability."""
+    payload = json.dumps([_AREA_MAXIMA_FORMAT, normalize_selection(selection)], sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def build_area_event_maxima(selection, out_path: str, progress_callback=None) -> dict:
+    """Reads the selection's gold rows kachel by kachel and writes one row per
+    simulation reaching it to the parquet out_path: the simulation's columns
+    (_SIMULATION_COLUMNS), its largest Fliesstiefe, Fliessgeschwindigkeit and
+    Druck over the selection's pixels (gold's units and column names), and
+    pixel_count, the number of those pixels it reaches. Written to a temp name
+    and moved into place, so an existing out_path is always complete.
+
+    `selection` as for build_raster_for_bbox; a pixel belongs to it if its
+    centre lies inside (_selection_where_sql).
+
+    Returns {'kacheln': the kacheln of the selection's rectangle,
+    'kacheln_missing': how many of them have no gold (not finalized, or
+    outside the simulated area)} -- with missing kacheln the maxima cover
+    only part of the selection.
+
+    Raises RasterBboxTooLargeError before any data is read if the selection
+    is too large (check_raster_size, the rasters' limit)."""
+    selection = normalize_selection(selection)
+    kacheln = kacheln_for_bbox(*selection_bounds(selection))
+    check_raster_size(selection)
+    print(f"\n[{datetime.now():%H:%M:%S}] Area event maxima over {len(kacheln)} kacheln")
+    kacheln_missing = 0
+    with _JobDir() as job_dir:
+        con = _job_connection(job_dir)
+        try:
+            con.execute("INSTALL httpfs; LOAD httpfs;")
+            configure_s3_for_duckdb(con)
+            if selection['type'] == 'polygon':
+                # Only for an actual polygon clip (ST_Contains, _selection_where_sql).
+                con.execute("INSTALL spatial; LOAD spatial;")
+            _create_event_maxima_per_kachel(con)
+            for done, id_kachel in enumerate(kacheln):
+                if progress_callback:
+                    progress_callback(done, len(kacheln), f"Kachel {done + 1}/{len(kacheln)}")
+                try:
+                    _insert_kachel_event_maxima(con, kachel_s3_file(id_kachel), selection)
+                except duckdb.HTTPException as error:
+                    if not _is_missing_kachel(error):
+                        raise
+                    kacheln_missing += 1
+            if progress_callback and kacheln:
+                progress_callback(len(kacheln), len(kacheln), "Schreibe Ereignisse…")
+            _write_event_maxima(con, out_path)
+        finally:
+            con.close()
+    return {'kacheln': len(kacheln), 'kacheln_missing': kacheln_missing}
+
+
+@contextlib.contextmanager
+def _area_ereignisse(maxima_path: str, p_h_mean: float | None, p_h_max: float | None,
+                     ablauf_override: pd.DataFrame | None):
+    """A connection with the temp table `ereignisse`: the simulations of
+    maxima_path (build_area_event_maxima) with their rate and its factors
+    (_events_sql), checked by _assert_valid_lambda_ereignis. Yields None if
+    no simulation reaches the area (nothing is read from S3 then).
+
+    A database of its own that can spill (_job_connection): a neighbourhood
+    is reached by millions of simulations."""
+    has_overrides = p_h_mean is not None or p_h_max is not None or ablauf_override is not None
+    with _JobDir() as job_dir:
+        con = _job_connection(job_dir)
+        try:
+            con.execute(f"CREATE TEMP VIEW event_maxima AS SELECT * FROM read_parquet('{maxima_path}')")
+            if con.execute("SELECT COUNT(*) FROM event_maxima").fetchone()[0] == 0:
+                yield None
+                return
+            con.execute("INSTALL httpfs; LOAD httpfs;")
+            configure_s3_for_duckdb(con)
+            _register_ablauf(con, ablauf_override)
+            _bind_probability_lookup(con, "SELECT DISTINCT id_anriss FROM event_maxima")
+            con.execute(f"CREATE TEMP TABLE ereignisse AS {_events_sql('event_maxima', p_h_mean, p_h_max)}")
+            _assert_valid_lambda_ereignis(con, "SELECT lambda_ereignis, lambda_Hangmuren FROM ereignisse",
+                                          "area", allow_zero=has_overrides)
+            yield con
+        finally:
+            con.close()
+
+
+def compute_ifk_for_area(maxima_path: str, *, p_h_mean: float | None = None, p_h_max: float | None = None,
+                         ablauf_override: pd.DataFrame | None = None) -> dict:
+    """IFK curves of an area from its simulations' maxima (maxima_path,
+    written by build_area_event_maxima): see the rule at the top of this
+    section.
+
+    Returns {'curves': {depth|velocity|pressure: df(intensity, p_exceedance,
+    return_period)}, 'anriss_events': df, 'n_ereignisse': int, 'expert_mode':
+    bool}, curves and anriss_events as compute_ifk_default returns them.
+    The events themselves (millions for a neighbourhood) are not returned:
+    write_area_ereignisse writes them to a file.
+
+    Expert-mode overrides as for build_raster_for_bbox: p_h_mean/p_h_max and
+    ablauf_override, no per-anriss overrides (an area is reached by thousands
+    of Anrisse, decision 2026-08-20)."""
+    empty_curve = pd.DataFrame(columns=['intensity', 'p_exceedance', 'return_period'])
+    result = {'curves': {variable: empty_curve.copy() for variable in INTENSITY_VARS},
+              'anriss_events': pd.DataFrame(columns=['id_anriss', 'x', 'y', 'anrissflaeche', 'lambda_ereignis_sum']),
+              'n_ereignisse': 0,
+              'expert_mode': p_h_mean is not None or p_h_max is not None or ablauf_override is not None}
+    with _area_ereignisse(maxima_path, p_h_mean, p_h_max, ablauf_override) as con:
+        if con is None:
+            return result
+        for variable in INTENSITY_VARS:
+            result['curves'][variable] = _ifk_curve(con, variable)
+        result['anriss_events'] = _anriss_events(con)
+        result['n_ereignisse'] = con.execute("SELECT COUNT(*) FROM ereignisse").fetchone()[0]
+    return result
+
+
+# The columns of write_area_ereignisse's file, in order: compute_ifk_default's
+# 'ereignisse' (the intensities here are the area maxima) plus pixel_count.
+AREA_EREIGNISSE_COLUMNS = ['id_prozessquelle', 'id_anriss', 'x_anriss', 'y_anriss', 'A', 'd', 'h', 'mu', 'xsi', 'tau0',
+                           'lambda_Hangmuren', 'p_raeumlich', 'p_A', 'p_h', 'p_ablauf',
+                           'depth', 'velocity', 'pressure', 'pixel_count', 'lambda_ereignis']
+
+
+def write_area_ereignisse(maxima_path: str, out_path: str, *, column_names: dict | None = None,
+                          p_h_mean: float | None = None, p_h_max: float | None = None,
+                          ablauf_override: pd.DataFrame | None = None) -> int:
+    """Writes the events behind compute_ifk_for_area's curves to out_path, one
+    row per simulation reaching the area (AREA_EREIGNISSE_COLUMNS, intensities
+    in display units: m, m/s, kN/m²), and returns the row count. The format
+    follows out_path's extension: '.parquet', anything else CSV with a header.
+    Written to a temp name and moved into place.
+
+    column_names renames columns in the file ({'depth': 'Fliesstiefe max [m]'});
+    the rest keep their names. Expert-mode arguments as compute_ifk_for_area."""
+    column_names = column_names or {}
+    file_format = "FORMAT parquet, COMPRESSION zstd" if out_path.endswith('.parquet') else "FORMAT csv, HEADER"
+    select_sql = ', '.join(f'"{column}" AS "{column_names.get(column, column)}"' for column in AREA_EREIGNISSE_COLUMNS)
+    unfinished_path = f"{out_path}.{uuid.uuid4().hex}.tmp"
+    with _area_ereignisse(maxima_path, p_h_mean, p_h_max, ablauf_override) as con:
+        if con is None:
+            # No simulation reaches the area: a file with the header only.
+            header = pd.DataFrame(columns=[column_names.get(column, column) for column in AREA_EREIGNISSE_COLUMNS])
+            if out_path.endswith('.parquet'):
+                header.to_parquet(unfinished_path)
+            else:
+                header.to_csv(unfinished_path, index=False)
+            os.replace(unfinished_path, out_path)
+            return 0
+        try:
+            con.execute(f"""
+                COPY (
+                    WITH in_display_units AS (
+                        SELECT *,
+                               "Fliesstiefe" / 100.0           AS depth,
+                               "Fliessgeschwindigkeit" / 100.0 AS velocity,
+                               "Druck"                         AS pressure
+                        FROM ereignisse
+                    )
+                    SELECT {select_sql}
+                    FROM in_display_units
+                    ORDER BY id_anriss, "A", h, mu, xsi, tau0
+                ) TO '{unfinished_path}' ({file_format})
+            """)
+            os.replace(unfinished_path, out_path)
+        finally:
+            if os.path.exists(unfinished_path):
+                os.remove(unfinished_path)
+        return con.execute("SELECT COUNT(*) FROM ereignisse").fetchone()[0]
